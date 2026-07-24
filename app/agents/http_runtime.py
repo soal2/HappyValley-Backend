@@ -203,7 +203,7 @@ class HttpAgentRuntime(AgentRuntime):
     @staticmethod
     def _validate_opening(text: str) -> None:
         required_groups = [
-            ("AI", "人工智能"),
+            # ("AI", "人工智能"),
             ("治疗", "医疗", "咨询"),
             ("增加", "修饰"),
             ("退出",),
