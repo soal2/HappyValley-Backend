@@ -2,9 +2,14 @@
 
 import asyncio
 
+import httpx
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.agents.base import RankedMatch
+from app.agents.fake_runtime import FakeAgentRuntime
+from app.container import Container
 from app.database import async_session_factory
 from app.models.queue import QueueEntry
 from tests.conftest import register_user
@@ -25,12 +30,70 @@ async def test_started_room_has_rule_legal_ai_team(client: AsyncClient) -> None:
     assert body["status"] == "started"
     snapshot = await client.get(f"/api/rooms/{body['room_id']}", headers=headers)
     team = snapshot.json()["stage_state"]["members"]
+    human = next(member for member in team if member["type"] == "human")
+    assert human["name"] == "匹配测试"
+    assert human["mbti"] == "INFP"
+    assert human["appearance_id"] == "sprite_01"
     roles = [member["role"] for member in team if member["type"] == "ai_peer"]
     assert roles.count("been-there") == 2
     assert roles.count("different-perspective") == 1
     assert roles.count("quiet-resonator") == 1
     assert len({member["id"] for member in team}) == 5
     assert snapshot.json()["stage"] == "AI_INTRO"
+
+
+async def test_activity_uses_rule_order_when_remote_ranking_is_unavailable(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UnavailableRankingRuntime(FakeAgentRuntime):
+        async def rank_candidates(
+            self, user_mood: str, user_age: int, candidates: list[dict[str, object]]
+        ) -> list[RankedMatch]:
+            raise httpx.ConnectError("上游 AI 无法连接")
+
+    monkeypatch.setattr(Container.get(), "agent_runtime", UnavailableRankingRuntime())
+    _, headers = await register_user(client, "网络降级")
+
+    response = await client.post(
+        "/api/activities", headers=headers, json={"mood": "想安静地画一会儿"}
+    )
+
+    assert response.status_code == 201
+    snapshot = await client.get(f"/api/rooms/{response.json()['room_id']}", headers=headers)
+    peers = [
+        member
+        for member in snapshot.json()["stage_state"]["members"]
+        if member["type"] == "ai_peer"
+    ]
+    assert len(peers) == 4
+    assert all(member["match_reason"].startswith("规则匹配") for member in peers)
+
+
+async def test_activity_uses_rule_order_when_remote_ranking_is_invalid(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class InvalidRankingRuntime(FakeAgentRuntime):
+        async def rank_candidates(
+            self, user_mood: str, user_age: int, candidates: list[dict[str, object]]
+        ) -> list[RankedMatch]:
+            return [RankedMatch(character_id="unknown", rank=1, reason="无效结果")]
+
+    monkeypatch.setattr(Container.get(), "agent_runtime", InvalidRankingRuntime())
+    _, headers = await register_user(client, "结果降级")
+
+    response = await client.post(
+        "/api/activities", headers=headers, json={"mood": "今天想画些暖色"}
+    )
+
+    assert response.status_code == 201
+    snapshot = await client.get(f"/api/rooms/{response.json()['room_id']}", headers=headers)
+    peers = [
+        member
+        for member in snapshot.json()["stage_state"]["members"]
+        if member["type"] == "ai_peer"
+    ]
+    assert len(peers) == 4
+    assert all(member["match_reason"].startswith("规则匹配") for member in peers)
 
 
 async def test_seventh_user_is_fifo_queued_then_gets_sixty_second_reservation(

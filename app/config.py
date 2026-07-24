@@ -1,6 +1,8 @@
 """Typed application configuration loaded from environment variables."""
 
 from functools import lru_cache
+from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +22,8 @@ class Settings(BaseSettings):
     AI_API_KEY: str | None = None
     AI_MODEL: str | None = None
     AI_BASE_URL: str | None = None
+    AI_NETWORK_MODE: Literal["auto", "direct", "proxy"] = "auto"
+    AI_PROXY_URL: str | None = None
     IMAGE_API_KEY: str | None = None
     IMAGE_MODEL: str | None = None
     IMAGE_BASE_URL: str | None = None
@@ -57,6 +61,29 @@ class Settings(BaseSettings):
         if self.MODE.lower() == "production" and self.TTS_ALLOW_ANONYMOUS_DEMO:
             raise ValueError("生产环境不能启用匿名 TTS")
         return self
+
+
+def expand_cors_origins(value: str) -> list[str]:
+    """Return configured origins plus the equivalent local development hostname."""
+    origins: list[str] = []
+
+    def add(origin: str) -> None:
+        if origin and origin not in origins:
+            origins.append(origin)
+
+    for raw_origin in value.split(","):
+        origin = raw_origin.strip()
+        add(origin)
+        parsed = urlsplit(origin)
+        alias = {"localhost": "127.0.0.1", "127.0.0.1": "localhost"}.get(
+            parsed.hostname or ""
+        )
+        if not alias:
+            continue
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        add(urlunsplit((parsed.scheme, f"{alias}{port}", "", "", "")))
+
+    return origins
 
 
 @lru_cache

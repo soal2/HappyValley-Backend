@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from urllib.request import getproxies
 
 import httpx
 import structlog
@@ -31,8 +32,21 @@ class HttpAgentRuntime(AgentRuntime):
         self._model = settings.AI_MODEL
         self._base_url = settings.AI_BASE_URL.rstrip("/")
         self._timeout = settings.AI_TIMEOUT_SECONDS
+        self._network_mode = settings.AI_NETWORK_MODE
+        self._proxy_url = settings.AI_PROXY_URL
+        if self._network_mode == "proxy" and not self._proxy_url:
+            raise RuntimeError("AI_NETWORK_MODE=proxy 时必须配置 AI_PROXY_URL")
+        if self._network_mode == "auto" and not self._proxy_url:
+            self._proxy_url = getproxies().get("https")
         self._client = client
         self._retry_delay_seconds = retry_delay_seconds
+
+    def _proxy_for_attempt(self, attempt: int) -> str | None:
+        if self._network_mode == "proxy":
+            return self._proxy_url
+        if self._network_mode == "auto" and attempt == 0:
+            return self._proxy_url
+        return None
 
     async def _call_chat(self, system_prompt: str, user_message: str) -> TextGenerationResult:
         """Make a single chat completion call with 1 retry."""
@@ -55,7 +69,12 @@ class HttpAgentRuntime(AgentRuntime):
                 if self._client:
                     response = await self._client.post(url, json=payload, headers=headers)
                 else:
-                    async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    proxy = self._proxy_for_attempt(attempt)
+                    async with httpx.AsyncClient(
+                        timeout=self._timeout,
+                        trust_env=False,
+                        proxy=proxy,
+                    ) as client:
                         response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
                 data = response.json()
@@ -82,6 +101,8 @@ class HttpAgentRuntime(AgentRuntime):
                 logger.warning(
                     "http_runtime.call_failed",
                     attempt=attempt + 1,
+                    network_route="proxy" if self._proxy_for_attempt(attempt) else "direct",
+                    error_type=type(e).__name__,
                     error=str(e),
                 )
                 if attempt == 0:
@@ -111,8 +132,8 @@ class HttpAgentRuntime(AgentRuntime):
         self, members: list[dict[str, object]], activity_rules: list[str]
     ) -> TextGenerationResult:
         result = await self._call_chat(
-            "你是心晴谷的 AI 团体带领者小晴。生成一段不超过180字的开场。必须明确说明："
-            "你和四位团友都是AI；这是游戏化心理互助而非医疗、诊断或治疗；用户先描述基础画面；"
+            "你是心晴谷的 AI 团体带领者小晴。生成一段不超过80字的开场。必须明确说明："
+            "这是游戏化心理互助而非医疗、诊断或治疗；用户先描述基础画面；"
             "后续成员只能增加或修饰，不能删除、否定或覆盖；用户可以随时退出。不要提出问题。",
             json.dumps({"members": members, "rules": activity_rules}, ensure_ascii=False),
         )
@@ -127,7 +148,7 @@ class HttpAgentRuntime(AgentRuntime):
         system_prompt = (
             "你是绘画疗愈文字接龙中的AI团友。严格以给定角色说话，只写本轮新增或修饰的画面描述。"
             "不得删除、否定、替换或覆盖已有画面，不评价用户，不诊断，不提出问题。"
-            "输出一段20至100字的中文纯文本，不要JSON、标题或角色名前缀。"
+            "输出一段20至50字的中文纯文本，不要JSON、标题或角色名前缀。"
         )
         user_msg = json.dumps(
             {

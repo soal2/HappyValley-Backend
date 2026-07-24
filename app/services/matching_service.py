@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import structlog
 import yaml
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,8 @@ from app.config import get_settings
 from app.domain.matching import MatchingEngine
 from app.models.character import Character
 from app.models.user import UserProfile
+
+logger = structlog.get_logger()
 
 
 def _load_config(path: str | None = None) -> tuple[str, list[dict[str, Any]]]:
@@ -90,11 +93,18 @@ async def match_team_for_user(
         for character in legal_team
     ]
     reasons = {character.id: "规则匹配：角色功能合法且年龄阶段较接近" for character in legal_team}
-    ranked = await agent_runtime.rank_candidates(user_mood, user_age, candidates)
-    valid_ids = {character.id for character in legal_team}
-    ordered_ids = [item.character_id for item in sorted(ranked, key=lambda item: item.rank)]
-    if set(ordered_ids) != valid_ids or len(ordered_ids) != 4:
-        raise RuntimeError("真实模型未返回完整且合法的四人匹配结果")
+    try:
+        ranked = await agent_runtime.rank_candidates(user_mood, user_age, candidates)
+        valid_ids = {character.id for character in legal_team}
+        ordered_ids = [item.character_id for item in sorted(ranked, key=lambda item: item.rank)]
+        if set(ordered_ids) != valid_ids or len(ordered_ids) != 4:
+            raise ValueError("真实模型未返回完整且合法的四人匹配结果")
+    except Exception as error:
+        logger.warning(
+            "matching.remote_ranking_unavailable",
+            error_type=type(error).__name__,
+        )
+        return [_public_character(character, reasons[character.id]) for character in legal_team]
     by_id = {character.id: character for character in legal_team}
     legal_team = [by_id[character_id] for character_id in ordered_ids]
     reasons.update({item.character_id: item.reason for item in ranked})

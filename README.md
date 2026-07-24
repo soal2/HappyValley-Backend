@@ -24,12 +24,18 @@ cp .env.example .env
 AI_API_KEY=...
 AI_MODEL=...
 AI_BASE_URL=https://your-provider.example/v1
+AI_NETWORK_MODE=auto
+AI_PROXY_URL=http://127.0.0.1:7890
 IMAGE_API_KEY=...
 IMAGE_MODEL=...
 IMAGE_BASE_URL=https://your-image-provider.example/v1
 ```
 
 适配器使用 OpenAI-compatible 的 HTTP envelope，但供应商、地址、密钥、模型和超时均来自环境变量，没有代码默认值。
+`AI_NETWORK_MODE=auto` 会优先使用 `AI_PROXY_URL`；未显式配置时读取系统 HTTPS
+代理。代理请求失败后，同一次生成会以 `trust_env=False` 直连重试。也可使用
+`direct` 强制直连，或使用 `proxy` 强制代理（此时必须配置 `AI_PROXY_URL`）。
+如果代理软件使用 Fake-IP DNS，关闭代理时仍需确保系统 DNS 已恢复真实地址。
 
 ### ElevenLabs 人物语音
 

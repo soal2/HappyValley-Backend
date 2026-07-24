@@ -29,17 +29,21 @@ def _valid_png(width: int = 64, height: int = 64) -> bytes:
     )
 
 
-def _settings() -> SimpleNamespace:
-    return SimpleNamespace(
-        AI_API_KEY="test-ai-key",
-        AI_MODEL="configured-chat-model",
-        AI_BASE_URL="https://models.example/v1",
-        AI_TIMEOUT_SECONDS=3.0,
-        IMAGE_API_KEY="test-image-key",
-        IMAGE_MODEL="configured-image-model",
-        IMAGE_BASE_URL="https://images.example/v1",
-        IMAGE_TIMEOUT_SECONDS=4.0,
-    )
+def _settings(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "AI_API_KEY": "test-ai-key",
+        "AI_MODEL": "configured-chat-model",
+        "AI_BASE_URL": "https://models.example/v1",
+        "AI_TIMEOUT_SECONDS": 3.0,
+        "AI_NETWORK_MODE": "direct",
+        "AI_PROXY_URL": None,
+        "IMAGE_API_KEY": "test-image-key",
+        "IMAGE_MODEL": "configured-image-model",
+        "IMAGE_BASE_URL": "https://images.example/v1",
+        "IMAGE_TIMEOUT_SECONDS": 4.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 async def test_chat_adapter_uses_configured_protocol_and_validates_json(
@@ -66,6 +70,110 @@ async def test_chat_adapter_uses_configured_protocol_and_validates_json(
     assert result[0].character_id == "c1"
     assert captured["authorization"] == "Bearer test-ai-key"
     assert "configured-chat-model" in str(captured["body"])
+
+
+async def test_chat_adapter_direct_mode_ignores_system_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.AsyncClient
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '[{"character_id":"c1","rank":1,"reason":"合适"}]'}}
+                ]
+            },
+        )
+
+    def client_factory(**options: object) -> httpx.AsyncClient:
+        if options.get("trust_env") is not False or options.get("proxy") is not None:
+            raise httpx.ConnectError("错误地使用了系统代理")
+        return real_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr("app.agents.http_runtime.get_settings", _settings)
+    monkeypatch.setattr("app.agents.http_runtime.httpx.AsyncClient", client_factory)
+
+    result = await HttpAgentRuntime(retry_delay_seconds=0).rank_candidates(
+        "平静", 20, [{"id": "c1"}]
+    )
+
+    assert result[0].character_id == "c1"
+
+
+async def test_chat_adapter_proxy_mode_uses_explicit_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.AsyncClient
+    expected_proxy = "http://127.0.0.1:7890"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '[{"character_id":"c1","rank":1,"reason":"合适"}]'}}
+                ]
+            },
+        )
+
+    def client_factory(**options: object) -> httpx.AsyncClient:
+        if options.get("trust_env") is not False or options.get("proxy") != expected_proxy:
+            raise httpx.ConnectError("没有使用显式 AI 代理")
+        return real_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(
+        "app.agents.http_runtime.get_settings",
+        lambda: _settings(AI_NETWORK_MODE="proxy", AI_PROXY_URL=expected_proxy),
+    )
+    monkeypatch.setattr("app.agents.http_runtime.httpx.AsyncClient", client_factory)
+
+    result = await HttpAgentRuntime(retry_delay_seconds=0).rank_candidates(
+        "平静", 20, [{"id": "c1"}]
+    )
+
+    assert result[0].character_id == "c1"
+
+
+async def test_chat_adapter_auto_mode_falls_back_from_proxy_to_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.AsyncClient
+    expected_proxy = "http://127.0.0.1:7890"
+    routes: list[object] = []
+
+    def proxy_failure(_: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("代理未启动")
+
+    def direct_success(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '[{"character_id":"c1","rank":1,"reason":"直连成功"}]'}}
+                ]
+            },
+        )
+
+    def client_factory(**options: object) -> httpx.AsyncClient:
+        route = options.get("proxy")
+        routes.append(route)
+        handler = proxy_failure if route == expected_proxy else direct_success
+        return real_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(
+        "app.agents.http_runtime.get_settings",
+        lambda: _settings(AI_NETWORK_MODE="auto", AI_PROXY_URL=expected_proxy),
+    )
+    monkeypatch.setattr("app.agents.http_runtime.httpx.AsyncClient", client_factory)
+
+    result = await HttpAgentRuntime(retry_delay_seconds=0).rank_candidates(
+        "平静", 20, [{"id": "c1"}]
+    )
+
+    assert result[0].reason == "直连成功"
+    assert routes == [expected_proxy, None]
 
 
 async def test_image_adapter_retries_once_and_returns_validated_bytes(
