@@ -1,0 +1,14 @@
+version: "1.0"
+activity_type: painting-relay
+facilitator:
+  name: "小晴"
+  appearance_id: "facilitator_xiaoqing_v1"
+opening:
+  text: "欢迎来到心晴谷绘画小屋。这里是游戏化心理互助活动，不替代心理咨询或治疗。今天四位团友由 AI 扮演，小晴也是 AI 带领者。你将先描述基础画面，四位 AI 团友只会依次增加或修饰内容。"
+  rules:
+    - "尊重每一位成员的表达"
+    - "只增加或修饰前序画面，不抹去他人的贡献"
+    - "需要休息时可以主动退出"
+postcard:
+  template_version: "painting-postcard-v1"
+  group_photo_version: "five-members-v1"

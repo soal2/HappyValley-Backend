@@ -1,0 +1,156 @@
+"""Room service: CRUD and state management for activity rooms."""
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from fastapi import HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.activity_states import ActivityStage, RoomStatus
+from app.domain.room_lock import room_lock_manager
+from app.domain.state_machine import advance_stage
+from app.models.room import ActivityRoom, RoomMessage
+
+
+async def create_room(
+    user_id: str, db: AsyncSession, *, stage_state: dict[str, Any] | None = None
+) -> ActivityRoom:
+    """Create a new activity room in WAITING stage."""
+    room = ActivityRoom(
+        user_id=user_id,
+        status=RoomStatus.ACTIVE.value,
+        current_stage=ActivityStage.HUMAN_BASE_PAINTING.value,
+        stage_state=stage_state or {},
+        started_at=datetime.now(UTC),
+        heartbeat_at=datetime.now(UTC),
+    )
+    db.add(room)
+    await db.flush()
+    return room
+
+
+async def get_room(room_id: str, user_id: str, db: AsyncSession) -> ActivityRoom:
+    """Fetch room, verify ownership."""
+    result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
+    room = result.scalar_one_or_none()
+    if room is None:
+        raise HTTPException(status_code=404, detail="房间不存在")
+    if room.user_id != user_id:
+        raise HTTPException(status_code=403, detail="无权访问此房间")
+    return room
+
+
+async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dict[str, Any]:
+    """Return full room state for reconnection."""
+    room = await get_room(room_id, user_id, db)
+
+    # Fetch messages summary
+    result = await db.execute(
+        select(RoomMessage)
+        .where(RoomMessage.room_id == room_id)
+        .order_by(RoomMessage.created_at.asc())
+    )
+    messages = result.scalars().all()
+    messages_data = [
+        {
+            "id": msg.id,
+            "sender_type": msg.sender_type,
+            "sender_id": msg.sender_id,
+            "text": msg.text,
+            "stage": msg.stage,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        }
+        for msg in messages
+    ]
+
+    return {
+        "room_id": room.id,
+        "stage": room.current_stage,
+        "stage_state": room.stage_state,
+        "status": room.status,
+        "revision": room.revision,
+        "messages": messages_data,
+        "created_at": room.created_at.isoformat() if room.created_at else None,
+    }
+
+
+async def advance_room_stage(
+    room_id: str,
+    target_stage: ActivityStage,
+    idempotency_key: str | None,
+    db: AsyncSession,
+) -> dict[str, str]:
+    """Acquire lock, validate, advance room stage, return new state."""
+    async with room_lock_manager.acquire(room_id):
+        result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
+        room = result.scalar_one_or_none()
+        if room is None:
+            raise HTTPException(status_code=404, detail="房间不存在")
+
+        transition_result = advance_stage(room, target_stage, idempotency_key)
+
+        # Update room status if terminal stage
+        if target_stage == ActivityStage.COMPLETED:
+            room.status = RoomStatus.COMPLETED.value
+            room.ended_at = datetime.now(UTC)
+            room_lock_manager.release(room_id)
+        elif target_stage == ActivityStage.TERMINATED:
+            room.status = RoomStatus.TERMINATED.value
+            room.ended_at = datetime.now(UTC)
+            room_lock_manager.release(room_id)
+
+        await db.flush()
+        return transition_result
+
+
+async def terminate_room(room_id: str, reason: str, db: AsyncSession) -> ActivityRoom:
+    """Set stage=TERMINATED, status=terminated, ended_at=now."""
+    result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
+    room = result.scalar_one_or_none()
+    if room is None:
+        raise HTTPException(status_code=404, detail="房间不存在")
+
+    room.current_stage = ActivityStage.TERMINATED.value
+    room.status = RoomStatus.TERMINATED.value
+    room.ended_at = datetime.now(UTC)
+
+    # Store termination reason in stage_state
+    state = dict(room.stage_state) if room.stage_state else {}
+    state["termination_reason"] = reason
+    room.stage_state = state
+
+    await db.flush()
+    room_lock_manager.release(room_id)
+    return room
+
+
+async def get_active_room_count(db: AsyncSession) -> int:
+    """Count rooms where status=active."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(ActivityRoom)
+        .where(ActivityRoom.status == RoomStatus.ACTIVE.value)
+    )
+    return result.scalar_one()
+
+
+async def update_heartbeat(room_id: str, db: AsyncSession) -> None:
+    """Update heartbeat_at to now."""
+    result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
+    room = result.scalar_one_or_none()
+    if room:
+        room.heartbeat_at = datetime.now(UTC)
+        await db.flush()
+
+
+async def find_timed_out_rooms(timeout_minutes: int, db: AsyncSession) -> list[ActivityRoom]:
+    """Find rooms where heartbeat_at < now - timeout."""
+    cutoff = datetime.now(UTC) - timedelta(minutes=timeout_minutes)
+    result = await db.execute(
+        select(ActivityRoom).where(
+            ActivityRoom.status == RoomStatus.ACTIVE.value,
+            ActivityRoom.heartbeat_at < cutoff,
+        )
+    )
+    return list(result.scalars().all())

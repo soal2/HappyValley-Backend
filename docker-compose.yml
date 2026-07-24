@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: happyvalley
+      POSTGRES_PASSWORD: happyvalley
+      POSTGRES_DB: happyvalley
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U happyvalley -d happyvalley"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - happyvalley_postgres:/var/lib/postgresql/data
+
+volumes:
+  happyvalley_postgres:
