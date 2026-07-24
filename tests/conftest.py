@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 TEST_DB_PATH = Path(__file__).parent / "test.db"
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB_PATH}"
 os.environ["SECRET_KEY"] = "test-only-secret"
-os.environ["MODE"] = "demo"
+os.environ["MODE"] = "test"
 os.environ["MEDIA_STORAGE_PATH"] = str(Path(__file__).parent / "media")
 
 from app.database import Base, engine  # noqa: E402

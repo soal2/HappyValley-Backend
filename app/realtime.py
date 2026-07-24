@@ -10,8 +10,10 @@ class ConnectionManager:
         self._connections: dict[str, WebSocket] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, room_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
+    async def connect(
+        self, room_id: str, websocket: WebSocket, subprotocol: str | None = None
+    ) -> None:
+        await websocket.accept(subprotocol=subprotocol)
         async with self._lock:
             previous = self._connections.get(room_id)
             self._connections[room_id] = websocket

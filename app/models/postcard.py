@@ -22,6 +22,7 @@ class Postcard(Base):
     encouragement_text: Mapped[str] = mapped_column(Text, nullable=False)
     summary_text: Mapped[str] = mapped_column(Text, nullable=False)
     artwork_text: Mapped[str] = mapped_column(Text, nullable=False)
+    generation_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     member_data: Mapped[list[dict[str, object]] | None] = mapped_column(JSON, nullable=True)
     template_version: Mapped[str] = mapped_column(String(20), nullable=False)
     share_token: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
@@ -48,6 +49,7 @@ class GeneratedImage(Base):
     status: Mapped[str] = mapped_column(
         String(20), default="pending", nullable=False
     )  # "pending"|"generating"|"completed"|"failed"
+    generation_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

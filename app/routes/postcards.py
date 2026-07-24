@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.container import Container
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.media.mime import image_media_type
 from app.models.postcard import Postcard
 from app.models.user import User
 from app.schemas.postcard import (
@@ -67,7 +68,7 @@ async def get_postcard_media(
     if not postcard.image_path:
         raise HTTPException(status_code=404, detail="本活动只有文字版作品")
     data = await Container.get().media_storage.read(postcard.image_path, user.id)
-    return Response(data, media_type="image/png")
+    return Response(data, media_type=image_media_type(data))
 
 
 @router.post("/api/postcards/{postcard_id}/share", response_model=ShareResponse)
@@ -114,4 +115,8 @@ async def public_postcard_media(share_token: str, db: AsyncSession = Depends(get
     if postcard is None or not postcard.image_path:
         raise HTTPException(status_code=404, detail="分享媒体不存在")
     data = await Container.get().media_storage.read(postcard.image_path, postcard.user_id)
-    return Response(data, media_type="image/png", headers={"X-Robots-Tag": "noindex, nofollow"})
+    return Response(
+        data,
+        media_type=image_media_type(data),
+        headers={"X-Robots-Tag": "noindex, nofollow"},
+    )

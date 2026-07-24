@@ -27,10 +27,12 @@ class Container:
             logger.info("container.init", mode="production")
             self.agent_runtime: AgentRuntime = HttpAgentRuntime()
             self.image_generator: ImageGenerator = HttpImageGenerator()
-        else:
-            logger.info("container.init", mode="demo")
+        elif mode == "test":
+            logger.info("container.init", mode="test")
             self.agent_runtime = FakeAgentRuntime()
             self.image_generator = FakeImageGenerator()
+        else:
+            raise RuntimeError("MODE 只允许 production 或 test；正式流程不提供 Fake/Demo 回退")
 
         # Always use local storage
         self.media_storage: MediaStorage = LocalMediaStorage()

@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RankedMatch(BaseModel):
@@ -14,12 +14,25 @@ class RankedMatch(BaseModel):
 class SummaryResult(BaseModel):
     summary_text: str
     encouragement_text: str
+    generation: "GenerationMeta | None" = None
+
+
+class GenerationMeta(BaseModel):
+    source: str
+    model: str
+    request_id: str
+
+
+class TextGenerationResult(BaseModel):
+    text: str = Field(min_length=1)
+    generation: GenerationMeta
 
 
 class ImageResult(BaseModel):
     data: bytes | None = None
     status: str  # "completed" | "failed"
     error: str | None = None
+    generation: GenerationMeta | None = None
 
 
 class AgentRuntime(ABC):
@@ -29,15 +42,21 @@ class AgentRuntime(ABC):
     ) -> list[RankedMatch]: ...
 
     @abstractmethod
-    async def generate_ai_turns(
-        self,
-        context: str,
-        characters: list[dict[str, object]],
-        previous_contributions: list[str],
-    ) -> list[str]: ...
+    async def generate_opening(
+        self, members: list[dict[str, object]], activity_rules: list[str]
+    ) -> TextGenerationResult: ...
 
     @abstractmethod
-    async def generate_follow_up(self, context: str, user_sharing: str) -> str: ...
+    async def generate_peer_turn(
+        self,
+        character: dict[str, object],
+        previous_contributions: list[str],
+    ) -> TextGenerationResult: ...
+
+    @abstractmethod
+    async def generate_facilitator_response(
+        self, context: str, user_sharing: str
+    ) -> TextGenerationResult: ...
 
     @abstractmethod
     async def generate_summary(
@@ -45,7 +64,9 @@ class AgentRuntime(ABC):
     ) -> SummaryResult: ...
 
     @abstractmethod
-    async def generate_postcard_text(self, context: str, user_sharing: str) -> str: ...
+    async def generate_postcard_text(
+        self, context: str, user_sharing: str
+    ) -> TextGenerationResult: ...
 
 
 class ImageGenerator(ABC):

@@ -16,7 +16,7 @@ cp .env.example .env
 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8083
 ```
 
-打开 `http://127.0.0.1:8000/docs` 查看 OpenAPI，健康检查为 `GET /health`。默认 `MODE=demo`，所有 AI 结果均为明确标记的本地确定性演示结果，不会调用外部模型。不要在生产中使用示例密码或 `SECRET_KEY`。
+打开 `http://127.0.0.1:8000/docs` 查看 OpenAPI，健康检查为 `GET /health`。默认 `MODE=production`，活动必须配置真实文本与图片模型；Fake runtime 只允许测试进程显式使用 `MODE=test`。TTS 只有在配置 ElevenLabs Key、角色 Voice ID 并调用语音端点时才会产生外部请求。不要在生产中使用示例密码或 `SECRET_KEY`。
 
 真实 HTTP 模式设置 `MODE=production`，并分别提供：
 
@@ -31,6 +31,28 @@ IMAGE_BASE_URL=https://your-image-provider.example/v1
 
 适配器使用 OpenAI-compatible 的 HTTP envelope，但供应商、地址、密钥、模型和超时均来自环境变量，没有代码默认值。
 
+### ElevenLabs 人物语音
+
+`POST /api/tts/synthesize` 使用服务端角色白名单调用 ElevenLabs Text to Speech API，返回 `audio/mpeg`。生产环境必须携带 JWT；API Key、模型、Voice ID 和角色声音参数不会下发到前端。
+
+```dotenv
+TTS_PROVIDER=elevenlabs
+ELEVENLABS_API_KEY=在部署平台的后端 Secret 中配置
+ELEVENLABS_TTS_MODEL=eleven_multilingual_v2
+ELEVENLABS_TTS_BASE_URL=https://api.elevenlabs.io/v1
+ELEVENLABS_TTS_TIMEOUT_SECONDS=20
+ELEVENLABS_TTS_OUTPUT_FORMAT=mp3_44100_128
+ELEVENLABS_VOICE_FACILITATOR_ID=
+ELEVENLABS_VOICE_YOU_ID=
+ELEVENLABS_VOICE_ZHU_ID=
+ELEVENLABS_VOICE_XIAOLI_ID=
+ELEVENLABS_VOICE_ZHANG_ID=
+ELEVENLABS_VOICE_LI_ID=
+TTS_ALLOW_ANONYMOUS_DEMO=false
+```
+
+Voice ID 可在 ElevenLabs 的 My Voices 中通过“More actions → Copy voice ID”获取。建议选择中文母语或中文口音自然的声音，并对六个角色分别试听。本地免登录试听必须显式设置 `TTS_ALLOW_ANONYMOUS_DEMO=true`；`MODE=production` 会拒绝该配置。不要把 ElevenLabs Key 提交到仓库、发到聊天中或放入任何 `VITE_*` 变量。
+
 ## REST 使用顺序
 
 所有私有接口使用 `Authorization: Bearer <JWT>`。
@@ -39,6 +61,7 @@ IMAGE_BASE_URL=https://your-image-provider.example/v1
 |---|---|
 | `POST /api/auth/register` | 用户名/密码注册；用户名是不可修改的公开昵称 |
 | `POST /api/auth/login` | 登录获取 JWT |
+| `POST /api/tts/synthesize` | 将人物气泡文本合成为 MP3；角色声音由后端控制 |
 | `POST /api/profile/complete` | 保存 MBTI、性别、出生年、预设外观 |
 | `POST /api/activities` | 提交 `{"mood":"..."}`；返回房间或 FIFO 位置 |
 | `GET /api/queue/me` | 轮询位置/60 秒预留 |
@@ -55,7 +78,7 @@ IMAGE_BASE_URL=https://your-image-provider.example/v1
 {"command_id":"client-unique-id","type":"submit_base","payload":{"text":"山谷里的一棵树"}}
 ```
 
-阶段命令顺序为 `submit_base` → `submit_sharing` → `answer_follow_up` 或 `skip_follow_up`。另有 `crisis_response`（`payload.can_continue`）、`heartbeat` 和 `exit`。重复命令 ID 返回 `already_processed`，不会重复生成图片或明信片。
+真实开场就绪后使用 `skip_current_stage` 进入真人第一笔，主流程命令为 `submit_base` → `submit_sharing`。另有 `retry_current_stage`、`retry_image`、`crisis_response`（`payload.can_continue`）、`heartbeat` 和 `exit`。旧追问命令只保留兼容解析并明确拒绝执行；重复命令 ID 返回 `already_processed`，不会重复生成图片或明信片。
 
 ## 原生 WebSocket
 

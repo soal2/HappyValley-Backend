@@ -57,7 +57,7 @@ async def has_occupancy(user_id: str, db: AsyncSession) -> bool:
     return room is not None or queue is not None
 
 
-async def claim_or_queue(user_id: str, db: AsyncSession) -> tuple[str, int | None]:
+async def claim_or_queue(user_id: str, mood: str, db: AsyncSession) -> tuple[str, int | None]:
     """Return direct capacity or create exactly one FIFO entry."""
     async with capacity_lock:
         await _expire_and_reserve(db)
@@ -76,6 +76,7 @@ async def claim_or_queue(user_id: str, db: AsyncSession) -> tuple[str, int | Non
                     user_id=user_id,
                     position=0,
                     status="reserved",
+                    mood=mood,
                     reserved_at=now,
                     expires_at=now + timedelta(seconds=get_settings().RESERVATION_SECONDS),
                 )
@@ -83,7 +84,12 @@ async def claim_or_queue(user_id: str, db: AsyncSession) -> tuple[str, int | Non
             await db.commit()
             return "direct", None
         max_position = await db.scalar(select(func.coalesce(func.max(QueueEntry.position), 0)))
-        entry = QueueEntry(user_id=user_id, position=int(max_position or 0) + 1, status="queued")
+        entry = QueueEntry(
+            user_id=user_id,
+            position=int(max_position or 0) + 1,
+            status="queued",
+            mood=mood,
+        )
         db.add(entry)
         await db.flush()
         position = await queue_position(entry, db)
@@ -115,7 +121,7 @@ async def status_for(user_id: str, db: AsyncSession) -> dict[str, object]:
         }
 
 
-async def consume_reservation(user_id: str, db: AsyncSession) -> None:
+async def consume_reservation(user_id: str, db: AsyncSession) -> str:
     async with capacity_lock:
         await _expire_and_reserve(db)
         entry = await db.scalar(
@@ -123,14 +129,28 @@ async def consume_reservation(user_id: str, db: AsyncSession) -> None:
         )
         if entry is None:
             raise HTTPException(status_code=409, detail="没有有效的预留席位")
+        mood = entry.mood
         await db.delete(entry)
         await db.flush()
+        return mood
 
 
 async def release_capacity(db: AsyncSession) -> None:
     async with capacity_lock:
         await _expire_and_reserve(db)
         await db.commit()
+
+
+async def cancel_for_user(user_id: str, db: AsyncSession) -> bool:
+    """Remove a queued or reserved entry before a room is created."""
+    async with capacity_lock:
+        entry = await db.scalar(select(QueueEntry).where(QueueEntry.user_id == user_id))
+        if entry is None:
+            return False
+        await db.delete(entry)
+        await db.flush()
+        await _expire_and_reserve(db)
+        return True
 
 
 async def maintain(db: AsyncSession) -> None:

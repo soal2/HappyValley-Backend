@@ -57,5 +57,6 @@ class RoomMessage(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     is_crisis: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    generation_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (Index("ix_room_messages_room_created", "room_id", "created_at"),)

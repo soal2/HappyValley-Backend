@@ -2,7 +2,13 @@
 
 import structlog
 
-from app.agents.base import AgentRuntime, RankedMatch, SummaryResult
+from app.agents.base import (
+    AgentRuntime,
+    GenerationMeta,
+    RankedMatch,
+    SummaryResult,
+    TextGenerationResult,
+)
 
 logger = structlog.get_logger()
 
@@ -14,6 +20,12 @@ def _candidate_age(candidate: dict[str, object], key: str, default: int) -> int:
 
 class FakeAgentRuntime(AgentRuntime):
     """Deterministic demo runtime – no external API calls."""
+
+    def __init__(self) -> None:
+        self.calls: dict[str, int] = {}
+
+    def _record(self, operation: str) -> None:
+        self.calls[operation] = self.calls.get(operation, 0) + 1
 
     async def rank_candidates(
         self, user_mood: str, user_age: int, candidates: list[dict[str, object]]
@@ -34,7 +46,7 @@ class FakeAgentRuntime(AgentRuntime):
             ),
         )
         results = []
-        for i, candidate in enumerate(sorted_candidates[:3]):
+        for i, candidate in enumerate(sorted_candidates):
             results.append(
                 RankedMatch(
                     character_id=str(candidate.get("id", f"char_{i}")),
@@ -44,31 +56,63 @@ class FakeAgentRuntime(AgentRuntime):
             )
         return results
 
-    async def generate_ai_turns(
-        self,
-        context: str,
-        characters: list[dict[str, object]],
-        previous_contributions: list[str],
-    ) -> list[str]:
-        logger.info("fake_runtime.generate_ai_turns", mode="demo")
-        return [
-            f"{character['name']}增加了一束从云间落下的暖光（demo 模式）"
-            for character in characters
-        ]
+    def _text(self, text: str, request_id: str) -> TextGenerationResult:
+        return TextGenerationResult(
+            text=text,
+            generation=GenerationMeta(
+                source="test", model="fake-test-model", request_id=request_id
+            ),
+        )
 
-    async def generate_follow_up(self, context: str, user_sharing: str) -> str:
-        logger.info("fake_runtime.generate_follow_up", mode="demo")
-        return "谢谢你愿意分享这些。能告诉我更多关于这种感受是什么时候开始的吗？"
+    async def generate_opening(
+        self, members: list[dict[str, object]], activity_rules: list[str]
+    ) -> TextGenerationResult:
+        self._record("opening")
+        return self._text(
+            "欢迎来到绘画小屋。我和四位团友都是 AI，这里是游戏化心理互助体验，"
+            "不能替代心理咨询或治疗。请只增加或修饰前面的画面，你也可以随时退出。",
+            "fake-opening",
+        )
+
+    async def generate_peer_turn(
+        self,
+        character: dict[str, object],
+        previous_contributions: list[str],
+    ) -> TextGenerationResult:
+        self._record("peer_turn")
+        logger.info("fake_runtime.generate_peer_turn", mode="test")
+        return self._text(
+            f"{character['name']}为画面增加了一束从云间落下的暖光",
+            f"fake-peer-{character['id']}",
+        )
+
+    async def generate_facilitator_response(
+        self, context: str, user_sharing: str
+    ) -> TextGenerationResult:
+        self._record("facilitator_response")
+        logger.info("fake_runtime.generate_facilitator_response", mode="test")
+        return self._text(
+            "我听见你认真看见了自己的感受。你愿意把它表达出来，这份真诚和觉察很珍贵。",
+            "fake-facilitator-response",
+        )
 
     async def generate_summary(
         self, context: str, transcript: list[dict[str, object]]
     ) -> SummaryResult:
+        self._record("summary")
         logger.info("fake_runtime.generate_summary", mode="demo")
         return SummaryResult(
             summary_text="在这次交流中，你勇敢地分享了自己的感受，并得到了温暖的回应。每一次倾诉都是疗愈的开始。",
-            encouragement_text="你今天做得很棒！记住，照顾好自己的情绪和照顾身体一样重要。明天又是新的一天。🌱",
+            encouragement_text="你今天认真看见并表达了自己的感受。愿这份觉察继续陪伴你。",
+            generation=GenerationMeta(
+                source="test", model="fake-test-model", request_id="fake-summary"
+            ),
         )
 
-    async def generate_postcard_text(self, context: str, user_sharing: str) -> str:
-        logger.info("fake_runtime.generate_postcard_text", mode="demo")
-        return "愿这张明信片带给你温暖和力量。你值得被温柔对待。🌸"
+    async def generate_postcard_text(self, context: str, user_sharing: str) -> TextGenerationResult:
+        self._record("postcard_text")
+        logger.info("fake_runtime.generate_postcard_text", mode="test")
+        return self._text(
+            "愿这张明信片提醒你，你一直拥有发现微光的能力。",
+            "fake-postcard",
+        )

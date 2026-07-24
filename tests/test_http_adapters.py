@@ -1,6 +1,8 @@
 """Real HTTP adapters validate protocols without paid external calls."""
 
 import base64
+import struct
+import zlib
 from types import SimpleNamespace
 
 import httpx
@@ -8,6 +10,23 @@ import pytest
 
 from app.agents.http_image import HttpImageGenerator
 from app.agents.http_runtime import HttpAgentRuntime
+from app.container import Container
+
+
+def _valid_png(width: int = 64, height: int = 64) -> bytes:
+    signature = b"\x89PNG\r\n\x1a\n"
+    raw = b"".join(b"\x00" + (b"\x8c\xb8\x78" * width) for _ in range(height))
+
+    def chunk(name: bytes, data: bytes) -> bytes:
+        payload = name + data
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
+
+    return (
+        signature
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
 
 
 def _settings() -> SimpleNamespace:
@@ -60,7 +79,10 @@ async def test_image_adapter_retries_once_and_returns_validated_bytes(
         if attempts == 1:
             return httpx.Response(503, text="temporary")
         assert "configured-image-model" in request.read().decode()
-        return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(b"png").decode()}]})
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(_valid_png()).decode()}]},
+        )
 
     monkeypatch.setattr("app.agents.http_image.get_settings", _settings)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -68,4 +90,84 @@ async def test_image_adapter_retries_once_and_returns_validated_bytes(
         result = await generator.generate("山谷")
     assert attempts == 2
     assert result.status == "completed"
-    assert result.data == b"png"
+    assert result.data == _valid_png()
+    assert result.generation is not None
+    assert result.generation.source == "remote"
+    assert result.generation.model == "configured-image-model"
+
+
+async def test_all_visible_text_generators_return_remote_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode()
+        request_id = f"remote-{len(request_ids) + 1}"
+        request_ids.append(request_id)
+        if "团体带领者小晴" in body:
+            text = (
+                "我和四位团友都是 AI，这里不是医疗或治疗。你先描述基础画面，"
+                "大家只增加或修饰前一笔，也可以随时退出。"
+            )
+        elif "文字接龙中的AI团友" in body:
+            text = "我为原有画面增加一条穿过草地的温柔溪流，让暖光落在水面上。"
+        elif "针对用户刚分享" in body:
+            text = "我听见了你的安心，你能辨认并表达这份感受，展现了细腻的自我觉察。"
+        elif "活动的总结者" in body:
+            text = (
+                '{"summary_text":"大家共同完成了一幅温暖的画。",'
+                '"encouragement_text":"愿你记得这份温暖。"}'
+            )
+        else:
+            text = "愿你保留此刻看见微光的能力，也温柔地陪伴自己。"
+        return httpx.Response(
+            200,
+            json={"id": request_id, "choices": [{"message": {"content": text}}]},
+        )
+
+    monkeypatch.setattr("app.agents.http_runtime.get_settings", _settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        runtime = HttpAgentRuntime(client, retry_delay_seconds=0)
+        opening = await runtime.generate_opening([], [])
+        peer = await runtime.generate_peer_turn({"name": "团友"}, ["一棵树"])
+        response = await runtime.generate_facilitator_response("共同画面", "我感到安心")
+        summary = await runtime.generate_summary("共同画面", [])
+        postcard = await runtime.generate_postcard_text("总结", "安心")
+
+    metadata = [
+        opening.generation,
+        peer.generation,
+        response.generation,
+        summary.generation,
+        postcard.generation,
+    ]
+    assert all(item is not None and item.source == "remote" for item in metadata)
+    assert [item.request_id for item in metadata if item is not None] == request_ids
+
+
+async def test_image_adapter_rejects_tiny_placeholder_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tiny = _valid_png(4, 4)
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(tiny).decode()}]},
+        )
+
+    monkeypatch.setattr("app.agents.http_image.get_settings", _settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HttpImageGenerator(client, retry_delay_seconds=0).generate("山谷")
+
+    assert result.status == "failed"
+    assert result.data is None
+
+
+def test_container_rejects_demo_mode_instead_of_loading_fake_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.container.get_settings", lambda: SimpleNamespace(MODE="demo"))
+    with pytest.raises(RuntimeError, match="production 或 test"):
+        Container()

@@ -7,9 +7,11 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 
 from app.agents.base import ImageGenerator, ImageResult
+from app.agents.fake_runtime import FakeAgentRuntime
 from app.container import Container
 from app.database import async_session_factory
 from app.models.postcard import GeneratedImage
+from app.services.activity_service import execute_command
 from tests.conftest import register_user
 
 
@@ -19,12 +21,45 @@ async def _start(client: AsyncClient, username: str = "闭环用户") -> tuple[s
         "/api/activities", headers=headers, json={"mood": "想和大家画一幅温暖的画"}
     )
     assert response.status_code == 201
-    return response.json()["room_id"], headers
+    room_id = response.json()["room_id"]
+    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    skipped = await client.post(
+        f"/api/rooms/{room_id}/commands",
+        headers=headers,
+        json={
+            "command_id": f"intro-{username}",
+            "type": "skip_current_stage",
+            "payload": {
+                "expected_stage": snapshot["stage"],
+                "expected_revision": snapshot["revision"],
+            },
+        },
+    )
+    assert skipped.status_code == 200, skipped.text
+    assert skipped.json()["snapshot"]["stage"] == "HUMAN_BASE_PAINTING"
+    return room_id, headers
+
+
+async def test_activity_starts_with_generated_facilitator_opening(client: AsyncClient) -> None:
+    _, headers = await register_user(client, "真实开场")
+    started = await client.post(
+        "/api/activities", headers=headers, json={"mood": "想和大家安静地画一会儿"}
+    )
+    snapshot = (await client.get(f"/api/rooms/{started.json()['room_id']}", headers=headers)).json()
+
+    assert snapshot["stage"] == "AI_INTRO"
+    opening = snapshot["messages"][-1]
+    assert opening["sender_id"] == "facilitator"
+    assert opening["generation"]["source"] == "test"
+    assert opening["generation"]["model"] == "fake-test-model"
 
 
 async def test_fake_ai_completes_p0_flow_and_cleans_temporary_context(
     client: AsyncClient,
 ) -> None:
+    runtime = Container.get().agent_runtime
+    assert isinstance(runtime, FakeAgentRuntime)
+    before = dict(runtime.calls)
     room_id, headers = await _start(client)
 
     relay = await client.post(
@@ -69,14 +104,7 @@ async def test_fake_ai_completes_p0_flow_and_cleans_temporary_context(
             "payload": {"text": "我看到小树时觉得自己也可以慢慢长大"},
         },
     )
-    assert sharing.json()["snapshot"]["stage"] == "AI_FOLLOW_UP"
-
-    completed = await client.post(
-        f"/api/rooms/{room_id}/commands",
-        headers=headers,
-        json={"command_id": "skip-1", "type": "skip_follow_up", "payload": {}},
-    )
-    snapshot = completed.json()["snapshot"]
+    snapshot = sharing.json()["snapshot"]
     assert snapshot["stage"] == "COMPLETED"
     assert snapshot["messages"] == []
     assert set(snapshot["stage_state"]) <= {
@@ -87,6 +115,12 @@ async def test_fake_ai_completes_p0_flow_and_cleans_temporary_context(
         "postcard_id",
         "processed_command_ids",
         "template_version",
+        "artwork_url",
+        "members",
+        "facilitator",
+        "image_status",
+        "generation_status",
+        "current_speaker_id",
     }
 
     postcard_id = snapshot["stage_state"]["postcard_id"]
@@ -105,6 +139,11 @@ async def test_fake_ai_completes_p0_flow_and_cleans_temporary_context(
             )
         )
     assert uncleared == 0
+    assert runtime.calls.get("opening", 0) - before.get("opening", 0) == 1
+    assert runtime.calls.get("peer_turn", 0) - before.get("peer_turn", 0) == 4
+    assert runtime.calls.get("facilitator_response", 0) - before.get("facilitator_response", 0) == 1
+    assert runtime.calls.get("summary", 0) - before.get("summary", 0) == 1
+    assert runtime.calls.get("postcard_text", 0) - before.get("postcard_text", 0) == 1
 
 
 class FailingImageGenerator(ImageGenerator):
@@ -137,12 +176,8 @@ async def test_image_failure_still_creates_text_postcard(client: AsyncClient) ->
                 "payload": {"text": "这盏灯让我安心"},
             },
         )
-        completed = await client.post(
-            f"/api/rooms/{room_id}/commands",
-            headers=headers,
-            json={"command_id": "skip-fail", "type": "skip_follow_up", "payload": {}},
-        )
-        postcard_id = completed.json()["snapshot"]["stage_state"]["postcard_id"]
+        completed = await client.get(f"/api/rooms/{room_id}", headers=headers)
+        postcard_id = completed.json()["stage_state"]["postcard_id"]
         postcard = await client.get(f"/api/postcards/{postcard_id}", headers=headers)
         assert postcard.json()["artwork"]["image_url"] is None
         assert postcard.json()["artwork"]["text_prompt"]
@@ -178,6 +213,35 @@ async def test_concurrent_duplicate_command_generates_once(client: AsyncClient) 
         if message["sender_type"] == "ai" and message["sender_id"] != "facilitator"
     ]
     assert len(ai_messages) == 4
+
+
+async def test_event_delivery_failure_does_not_abort_room_orchestration(
+    client: AsyncClient,
+) -> None:
+    room_id, headers = await _start(client, "广播中断")
+    user_id = (await client.get("/api/auth/me", headers=headers)).json()["user_id"]
+    container = Container.get()
+
+    async def disconnected_emitter(_: dict[str, object]) -> None:
+        raise RuntimeError("socket already closed")
+
+    async with async_session_factory() as session:
+        result = await execute_command(
+            room_id,
+            user_id,
+            "base-after-disconnect",
+            "submit_base",
+            {"text": "雨后森林里的一道浅浅彩虹"},
+            session,
+            container.agent_runtime,
+            container.image_generator,
+            container.media_storage,
+            disconnected_emitter,
+        )
+    assert result == "accepted"
+    snapshot = await client.get(f"/api/rooms/{room_id}", headers=headers)
+    assert snapshot.json()["stage"] == "HUMAN_SHARING"
+    assert len(snapshot.json()["stage_state"]["contributions"]) == 5
 
 
 async def test_active_exit_removes_temporary_generated_media(client: AsyncClient) -> None:

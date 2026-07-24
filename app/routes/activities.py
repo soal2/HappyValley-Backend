@@ -1,11 +1,14 @@
 """Activity, queue, room, and command REST endpoints."""
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.container import Container
 from app.database import get_db
 from app.dependencies import get_current_user, require_profile_completed
+from app.media.mime import image_media_type
+from app.models.postcard import GeneratedImage
 from app.models.user import User
 from app.schemas.activity import (
     QueueStatusResponse,
@@ -27,13 +30,16 @@ async def start_activity(
     user: User = Depends(require_profile_completed),
     db: AsyncSession = Depends(get_db),
 ) -> StartActivityResponse:
-    claim, position = await queue_service.claim_or_queue(user.id, db)
+    active_room = await room_service.get_active_room_for_user(user.id, db)
+    if active_room is not None:
+        return StartActivityResponse(status="started", room_id=active_room.id)
+    claim, position = await queue_service.claim_or_queue(user.id, request.mood, db)
     if claim == "queued":
         response.status_code = status.HTTP_202_ACCEPTED
         return StartActivityResponse(status="queued", queue_position=position)
-    await queue_service.consume_reservation(user.id, db)
+    mood = await queue_service.consume_reservation(user.id, db)
     room = await activity_service.create_activity_room(
-        user, request.mood, db, Container.get().agent_runtime
+        user, mood, db, Container.get().agent_runtime
     )
     response.status_code = status.HTTP_201_CREATED
     return StartActivityResponse(status="started", room_id=room.id)
@@ -46,18 +52,36 @@ async def queue_status(
     return QueueStatusResponse(**await queue_service.status_for(user.id, db))
 
 
+@router.delete("/api/queue/me", status_code=204)
+async def cancel_queue(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> None:
+    await queue_service.cancel_for_user(user.id, db)
+
+
 @router.post("/api/queue/confirm", response_model=StartActivityResponse)
 async def confirm_queue(
     response: Response,
     user: User = Depends(require_profile_completed),
     db: AsyncSession = Depends(get_db),
 ) -> StartActivityResponse:
-    await queue_service.consume_reservation(user.id, db)
+    mood = await queue_service.consume_reservation(user.id, db)
     room = await activity_service.create_activity_room(
-        user, "等待后进入活动", db, Container.get().agent_runtime
+        user, mood, db, Container.get().agent_runtime
     )
     response.status_code = status.HTTP_201_CREATED
     return StartActivityResponse(status="started", room_id=room.id)
+
+
+@router.get("/api/rooms/active", response_model=RoomSnapshotResponse)
+async def active_room_snapshot(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RoomSnapshotResponse:
+    room = await room_service.get_active_room_for_user(user.id, db)
+    if room is None:
+        raise HTTPException(status_code=404, detail="当前没有进行中的活动")
+    return RoomSnapshotResponse(**await room_service.get_room_snapshot(room.id, user.id, db))
 
 
 @router.get("/api/rooms/{room_id}", response_model=RoomSnapshotResponse)
@@ -67,6 +91,27 @@ async def room_snapshot(
     db: AsyncSession = Depends(get_db),
 ) -> RoomSnapshotResponse:
     return RoomSnapshotResponse(**await room_service.get_room_snapshot(room_id, user.id, db))
+
+
+@router.get("/api/rooms/{room_id}/artwork")
+async def room_artwork(
+    room_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    room = await room_service.get_room(room_id, user.id, db)
+    artwork_path = (room.stage_state or {}).get("artwork_path")
+    if not artwork_path:
+        raise HTTPException(status_code=404, detail="本活动尚无可读取的画作")
+    image = await db.scalar(
+        select(GeneratedImage)
+        .where(GeneratedImage.room_id == room_id, GeneratedImage.file_path == artwork_path)
+        .order_by(GeneratedImage.created_at.desc())
+    )
+    if image is None or image.status != "completed":
+        raise HTTPException(status_code=404, detail="画作尚未生成完成")
+    data = await Container.get().media_storage.read(str(artwork_path), user.id)
+    return Response(data, media_type=image_media_type(data))
 
 
 @router.post("/api/rooms/{room_id}/commands", response_model=RoomCommandResponse)

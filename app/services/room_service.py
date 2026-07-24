@@ -16,11 +16,11 @@ from app.models.room import ActivityRoom, RoomMessage
 async def create_room(
     user_id: str, db: AsyncSession, *, stage_state: dict[str, Any] | None = None
 ) -> ActivityRoom:
-    """Create a new activity room in WAITING stage."""
+    """Create a new activity room in AI introduction stage."""
     room = ActivityRoom(
         user_id=user_id,
         status=RoomStatus.ACTIVE.value,
-        current_stage=ActivityStage.HUMAN_BASE_PAINTING.value,
+        current_stage=ActivityStage.AI_INTRO.value,
         stage_state=stage_state or {},
         started_at=datetime.now(UTC),
         heartbeat_at=datetime.now(UTC),
@@ -39,6 +39,17 @@ async def get_room(room_id: str, user_id: str, db: AsyncSession) -> ActivityRoom
     if room.user_id != user_id:
         raise HTTPException(status_code=403, detail="无权访问此房间")
     return room
+
+
+async def get_active_room_for_user(user_id: str, db: AsyncSession) -> ActivityRoom | None:
+    """Return the user's current active room for refresh recovery."""
+    result = await db.execute(
+        select(ActivityRoom)
+        .where(ActivityRoom.user_id == user_id, ActivityRoom.status == "active")
+        .order_by(ActivityRoom.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dict[str, Any]:
@@ -60,6 +71,7 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
             "text": msg.text,
             "stage": msg.stage,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            "generation": msg.generation_meta,
         }
         for msg in messages
     ]
@@ -67,12 +79,41 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
     return {
         "room_id": room.id,
         "stage": room.current_stage,
-        "stage_state": room.stage_state,
+        "stage_state": _public_stage_state(room),
         "status": room.status,
         "revision": room.revision,
         "messages": messages_data,
         "created_at": room.created_at.isoformat() if room.created_at else None,
     }
+
+
+def _public_stage_state(room: ActivityRoom) -> dict[str, Any]:
+    state = dict(room.stage_state or {})
+    allowed = {
+        "activity_type",
+        "activity_version",
+        "template_version",
+        "members",
+        "facilitator",
+        "contributions",
+        "current_speaker_id",
+        "generation_status",
+        "generation_error",
+        "image_status",
+        "stage_deadline_at",
+        "can_skip",
+        "postcard_id",
+        "crisis",
+        "termination_reason",
+        "final_prompt",
+        "summary_text",
+    }
+    public = {key: value for key, value in state.items() if key in allowed}
+    if state.get("artwork_path"):
+        public["artwork_url"] = f"/api/rooms/{room.id}/artwork"
+    else:
+        public["artwork_url"] = None
+    return public
 
 
 async def advance_room_stage(

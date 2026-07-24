@@ -16,9 +16,27 @@ from app.services import activity_service, auth_service, room_service
 router = APIRouter()
 
 
+async def _safe_send(websocket: WebSocket, payload: dict[str, object]) -> bool:
+    try:
+        await websocket.send_json(payload)
+        return True
+    except (RuntimeError, WebSocketDisconnect):
+        return False
+
+
 @router.websocket("/api/rooms/{room_id}/ws")
 async def room_websocket(websocket: WebSocket, room_id: str) -> None:
-    token = websocket.query_params.get("token")
+    requested_protocols = [
+        item.strip()
+        for item in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if item.strip()
+    ]
+    protocol_token = (
+        requested_protocols[1]
+        if len(requested_protocols) == 2 and requested_protocols[0] == "happyvalley.jwt"
+        else None
+    )
+    token = protocol_token or websocket.query_params.get("token")
     if not token:
         await websocket.close(code=4401, reason="缺少认证令牌")
         return
@@ -36,30 +54,51 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
         if room.user_id != user_id:
             await websocket.close(code=4403, reason="无权访问此房间")
             return
-        await connection_manager.connect(room_id, websocket)
+        await connection_manager.connect(
+            room_id,
+            websocket,
+            subprotocol="happyvalley.jwt" if protocol_token else None,
+        )
         room.disconnected_at = None
         room.heartbeat_at = datetime.now(UTC)
         await db.commit()
 
     try:
         async with async_session_factory() as db:
+            container = Container.get()
+            await activity_service.resume_interrupted_activity(
+                room_id,
+                user_id,
+                db,
+                container.agent_runtime,
+                container.image_generator,
+                container.media_storage,
+            )
             snapshot = await room_service.get_room_snapshot(room_id, user_id, db)
-            await websocket.send_json({"type": "snapshot", "data": snapshot})
+            if not await _safe_send(websocket, {"type": "snapshot", "data": snapshot}):
+                return
         while True:
             raw = await websocket.receive_json()
             try:
                 command = RoomCommandRequest.model_validate(raw)
             except ValidationError as error:
-                await websocket.send_json(
-                    {"type": "error", "error": "invalid_command", "detail": error.errors()}
+                await _safe_send(
+                    websocket,
+                    {"type": "error", "error": "invalid_command", "detail": error.errors()},
                 )
                 continue
-            await websocket.send_json(
-                {"type": "progress", "command_id": command.command_id, "status": "processing"}
-            )
+            if not await _safe_send(
+                websocket,
+                {"type": "progress", "command_id": command.command_id, "status": "processing"},
+            ):
+                return
             async with async_session_factory() as db:
                 container = Container.get()
                 try:
+
+                    async def emit(event: dict[str, object]) -> None:
+                        await _safe_send(websocket, event)
+
                     result = await activity_service.execute_command(
                         room_id,
                         user_id,
@@ -70,27 +109,33 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                         container.agent_runtime,
                         container.image_generator,
                         container.media_storage,
+                        emit,
                     )
                     await db.commit()
                     snapshot = await room_service.get_room_snapshot(room_id, user_id, db)
-                    await websocket.send_json(
+                    if not await _safe_send(
+                        websocket,
                         {
                             "type": "command_result",
                             "command_id": command.command_id,
                             "status": result,
                             "data": snapshot,
-                        }
-                    )
+                        },
+                    ):
+                        return
                 except Exception as error:
                     await db.rollback()
-                    await websocket.send_json(
+                    if not await _safe_send(
+                        websocket,
                         {
                             "type": "error",
                             "command_id": command.command_id,
                             "error": "command_rejected",
                             "detail": str(error),
-                        }
-                    )
+                            "recoverable": True,
+                        },
+                    ):
+                        return
     except WebSocketDisconnect:
         pass
     finally:

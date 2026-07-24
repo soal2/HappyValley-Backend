@@ -13,7 +13,22 @@ from tests.conftest import register_user
 async def _start(client: AsyncClient, username: str) -> tuple[str, dict[str, str]]:
     _, headers = await register_user(client, username)
     response = await client.post("/api/activities", headers=headers, json={"mood": "今天想画画"})
-    return response.json()["room_id"], headers
+    room_id = response.json()["room_id"]
+    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    skipped = await client.post(
+        f"/api/rooms/{room_id}/commands",
+        headers=headers,
+        json={
+            "command_id": f"intro-{username}",
+            "type": "skip_current_stage",
+            "payload": {
+                "expected_stage": snapshot["stage"],
+                "expected_revision": snapshot["revision"],
+            },
+        },
+    )
+    assert skipped.status_code == 200, skipped.text
+    return room_id, headers
 
 
 async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) -> str:
@@ -35,12 +50,8 @@ async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) 
             "payload": {"text": "海风让我放松"},
         },
     )
-    completed = await client.post(
-        f"/api/rooms/{room_id}/commands",
-        headers=headers,
-        json={"command_id": "skip", "type": "skip_follow_up", "payload": {}},
-    )
-    return completed.json()["snapshot"]["stage_state"]["postcard_id"]
+    completed = await client.get(f"/api/rooms/{room_id}", headers=headers)
+    return completed.json()["stage_state"]["postcard_id"]
 
 
 async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: AsyncClient) -> None:

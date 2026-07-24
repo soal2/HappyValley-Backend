@@ -29,7 +29,10 @@ async def test_websocket_requires_owner_jwt_and_restores_snapshot(client: AsyncC
         except WebSocketDisconnect as error:
             assert error.code == 4403
 
-        with sync_client.websocket_connect(f"/api/rooms/{room_id}/ws?token={token}") as socket:
+        with sync_client.websocket_connect(
+            f"/api/rooms/{room_id}/ws", subprotocols=["happyvalley.jwt", token]
+        ) as socket:
+            assert socket.accepted_subprotocol == "happyvalley.jwt"
             first = socket.receive_json()
             assert first["type"] == "snapshot"
             assert first["data"]["room_id"] == room_id
@@ -42,7 +45,7 @@ async def test_websocket_requires_owner_jwt_and_restores_snapshot(client: AsyncC
         with sync_client.websocket_connect(f"/api/rooms/{room_id}/ws?token={token}") as resumed:
             snapshot = resumed.receive_json()
             assert snapshot["type"] == "snapshot"
-            assert snapshot["data"]["stage"] == "HUMAN_BASE_PAINTING"
+            assert snapshot["data"]["stage"] == "AI_INTRO"
 
         with sync_client.websocket_connect(f"/api/rooms/{room_id}/ws?token={token}") as old:
             assert old.receive_json()["type"] == "snapshot"

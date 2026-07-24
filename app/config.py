@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,7 +15,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_HOURS: int = 168
-    MODE: str = "demo"
+    MODE: str = "production"
 
     AI_API_KEY: str | None = None
     AI_MODEL: str | None = None
@@ -24,6 +25,21 @@ class Settings(BaseSettings):
     IMAGE_BASE_URL: str | None = None
     AI_TIMEOUT_SECONDS: float = 30.0
     IMAGE_TIMEOUT_SECONDS: float = 60.0
+    TTS_PROVIDER: str = "elevenlabs"
+    ELEVENLABS_API_KEY: str | None = None
+    ELEVENLABS_TTS_MODEL: str = "eleven_multilingual_v2"
+    ELEVENLABS_TTS_BASE_URL: str = "https://api.elevenlabs.io/v1"
+    ELEVENLABS_TTS_TIMEOUT_SECONDS: float = 20.0
+    ELEVENLABS_TTS_OUTPUT_FORMAT: str = "mp3_44100_128"
+    ELEVENLABS_VOICE_FACILITATOR_ID: str | None = None
+    ELEVENLABS_VOICE_YOU_ID: str | None = None
+    ELEVENLABS_VOICE_ZHU_ID: str | None = None
+    ELEVENLABS_VOICE_XIAOLI_ID: str | None = None
+    ELEVENLABS_VOICE_ZHANG_ID: str | None = None
+    ELEVENLABS_VOICE_LI_ID: str | None = None
+    TTS_ALLOW_ANONYMOUS_DEMO: bool = False
+    TTS_CACHE_MAX_ITEMS: int = 128
+    TTS_CACHE_TTL_SECONDS: int = 600
     MAX_ACTIVE_ROOMS: int = 6
     RESERVATION_SECONDS: int = 60
     RECONNECT_SECONDS: int = 300
@@ -35,6 +51,12 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost:5173"
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    @model_validator(mode="after")
+    def reject_anonymous_tts_in_production(self) -> "Settings":
+        if self.MODE.lower() == "production" and self.TTS_ALLOW_ANONYMOUS_DEMO:
+            raise ValueError("生产环境不能启用匿名 TTS")
+        return self
 
 
 @lru_cache

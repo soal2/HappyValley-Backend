@@ -50,6 +50,12 @@ class CleanupService:
             "template_version": old_state.get("template_version"),
             "postcard_id": old_state.get("postcard_id"),
             "processed_command_ids": old_state.get("processed_command_ids", []),
+            "members": old_state.get("members", []),
+            "facilitator": old_state.get("facilitator"),
+            "artwork_path": old_state.get("artwork_path"),
+            "image_status": old_state.get("image_status"),
+            "generation_status": "ready",
+            "current_speaker_id": None,
         }
         room.stage_state = minimal_state
 
