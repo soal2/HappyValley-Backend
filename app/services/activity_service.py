@@ -29,7 +29,7 @@ from app.models.user import User
 from app.services import matching_service, queue_service, room_service
 from app.services.cleanup_service import CleanupService
 from app.services.crisis_service import CrisisService
-from app.services.speech_service import prepare_speech_meta
+from app.services.speech_service import estimated_duration_ms, prepare_speech_meta, split_speech
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 logger = structlog.get_logger()
@@ -527,6 +527,8 @@ async def _complete_v2_activity(
         try:
             summary = None
             summary_speech: dict[str, object] | None = None
+            candidate = None
+            candidate_speech: dict[str, object] | None = None
             for _ in range(2):
                 candidate = await agent_runtime.generate_summary(
                     str(state.get("final_prompt", "")),
@@ -540,8 +542,28 @@ async def _complete_v2_activity(
                     summary = candidate
                     summary_speech = candidate_speech
                     break
-            if summary is None or summary_speech is None:
-                raise ValueError("小晴总结超过语音时长限制")
+            if summary is None:
+                kept_chunks: list[str] = []
+                running_ms = 0
+                for chunk in split_speech(candidate.summary_text if candidate else ""):
+                    chunk_ms = estimated_duration_ms(chunk)
+                    if running_ms + chunk_ms > 20_000:
+                        break
+                    kept_chunks.append(chunk)
+                    running_ms += chunk_ms
+                truncated = "".join(kept_chunks) or (candidate.summary_text[:28] if candidate else "")
+                summary = SummaryResult(
+                    summary_text=truncated,
+                    encouragement_text=candidate.encouragement_text if candidate else "",
+                    generation=candidate.generation if candidate else None,
+                )
+                summary_speech = await prepare_speech_meta(truncated, "facilitator", 20_000)
+                logger.warning(
+                    "activity.summary_truncated",
+                    original_chars=len(candidate.summary_text) if candidate else 0,
+                    truncated_chars=len(truncated),
+                    duration_ms=summary_speech.get("total_duration_ms"),
+                )
         except Exception as error:
             state.update(generation_status="failed", generation_error=str(error))
             await _commit_state(

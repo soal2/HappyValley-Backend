@@ -305,8 +305,9 @@ class HttpAgentRuntime(AgentRuntime):
             "你是心晴谷的AI团体带领者小晴。根据真实对话生成简短总结和鼓励语。"
             "优先准确回应真人玩家实际说过的话，再总结共同主题、可见的美好品质、"
             "解决问题的多样视角与温暖安全的团体氛围。若真人四轮都跳过，只总结"
-            f"共同画作和已经发生的互动，不推测真人感受，不诊断、不承诺治愈。"
-            f"总结朗读须在{max_duration_seconds}秒内完成。"
+            "共同画作和已经发生的互动，不推测真人感受，不诊断、不承诺治愈。"
+            f"summary_text 必须在 70 个汉字以内（约 {max_duration_seconds} 秒朗读）、不超过 3 个句子；"
+            "encouragement_text 必须在 30 个汉字以内。不要输出 JSON 以外的内容。"
             '返回JSON: {"summary_text": "...", "encouragement_text": "..."}'
         )
         user_msg = json.dumps({"context": context, "transcript": transcript}, ensure_ascii=False)
