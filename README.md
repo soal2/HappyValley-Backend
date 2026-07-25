@@ -13,10 +13,10 @@ python3.12 -m venv .venv
 cp .env.example .env
 .venv/bin/alembic upgrade head
 .venv/bin/python -m scripts.seed_db
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8083
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-打开 `http://127.0.0.1:8000/docs` 查看 OpenAPI，健康检查为 `GET /health`。默认 `MODE=production`，活动必须配置真实文本与图片模型；Fake runtime 只允许测试进程显式使用 `MODE=test`。TTS 只有在配置 ElevenLabs Key、角色 Voice ID 并调用语音端点时才会产生外部请求。不要在生产中使用示例密码或 `SECRET_KEY`。
+打开 `http://127.0.0.1:8083/docs` 查看 OpenAPI，健康检查为 `GET /health`。默认 `MODE=production`，活动必须配置真实文本与图片模型；Fake runtime 只允许测试进程显式使用 `MODE=test`。TTS 支持 `elevenlabs` 与 `edge` provider，活动消息会在服务端预生成规范语音片段和实际/估算时长。不要在生产中使用示例密码或 `SECRET_KEY`。
 
 真实 HTTP 模式设置 `MODE=production`，并分别提供：
 
@@ -59,6 +59,8 @@ TTS_ALLOW_ANONYMOUS_DEMO=false
 
 Voice ID 可在 ElevenLabs 的 My Voices 中通过“More actions → Copy voice ID”获取。建议选择中文母语或中文口音自然的声音，并对六个角色分别试听。本地免登录试听必须显式设置 `TTS_ALLOW_ANONYMOUS_DEMO=true`；`MODE=production` 会拒绝该配置。不要把 ElevenLabs Key 提交到仓库、发到聊天中或放入任何 `VITE_*` 变量。
 
+也可配置 `TTS_PROVIDER=edge` 使用现有 Edge TTS 角色音色。两种 provider 的 `/api/tts/synthesize` 都返回 `X-TTS-Duration-Ms`（能够从 MP3 读取时），供活动语音时长校准；TTS 失败只降级为文字阅读计时，不改变业务阶段。
+
 ## REST 使用顺序
 
 所有私有接口使用 `Authorization: Bearer <JWT>`。
@@ -81,10 +83,12 @@ Voice ID 可在 ElevenLabs 的 My Voices 中通过“More actions → Copy voice
 命令统一格式：
 
 ```json
-{"command_id":"client-unique-id","type":"submit_base","payload":{"text":"山谷里的一棵树"}}
+{"command_id":"client-unique-id","type":"submit_painting_turn","payload":{"turn_index":2,"text":"山谷里的一棵树"}}
 ```
 
-真实开场就绪后使用 `skip_current_stage` 进入真人第一笔，主流程命令为 `submit_base` → `submit_sharing`。另有 `retry_current_stage`、`retry_image`、`crisis_response`（`payload.can_continue`）、`heartbeat` 和 `exit`。旧追问命令只保留兼容解析并明确拒绝执行；重复命令 ID 返回 `already_processed`，不会重复生成图片或明信片。
+V2 主流程命令为 `submit_painting_turn` → `complete_artwork_reveal` → 每轮 `submit_reflection` 或 `skip_reflection`。另有 `retry_current_stage`、`retry_image`、`crisis_response`（`payload.can_continue`）、`heartbeat` 和 `exit`。`submit_base`、`submit_sharing` 与旧追问命令只保留兼容解析并对 V2 明确拒绝；重复命令 ID 返回 `already_processed`，不会重复生成消息、图片或明信片。
+
+房间创建时生成包含一位真人和四位 AI 的 `speaking_order`，绘画接龙与四轮回顾始终复用该顺序。完整无重试活动执行 27 次独立文本生成与 1 次图片生成；画作必须经 `complete_artwork_reveal` 确认后才开始第一轮回顾。完成态保留 V2 消息和游标供刷新恢复，同时清除图片 Prompt 历史；中止态仍删除临时消息和媒体。
 
 ## 原生 WebSocket
 

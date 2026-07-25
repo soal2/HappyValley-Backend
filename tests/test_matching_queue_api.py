@@ -35,11 +35,14 @@ async def test_started_room_has_rule_legal_ai_team(client: AsyncClient) -> None:
     assert human["mbti"] == "INFP"
     assert human["appearance_id"] == "sprite_01"
     roles = [member["role"] for member in team if member["type"] == "ai_peer"]
+    ai_mbti = [member["mbti"] for member in team if member["type"] == "ai_peer"]
     assert roles.count("been-there") == 2
     assert roles.count("different-perspective") == 1
     assert roles.count("quiet-resonator") == 1
+    assert len(set(ai_mbti)) == 4
     assert len({member["id"] for member in team}) == 5
-    assert snapshot.json()["stage"] == "AI_INTRO"
+    assert snapshot.json()["stage"] == "PAINTING_TURN"
+    assert len(snapshot.json()["stage_state"]["speaking_order"]) == 5
 
 
 async def test_activity_uses_rule_order_when_remote_ranking_is_unavailable(

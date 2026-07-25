@@ -30,34 +30,47 @@ class CleanupService:
 
         Returns cleanup summary.
         """
-        # 1. Delete all room messages
-        msg_result = await db.execute(delete(RoomMessage).where(RoomMessage.room_id == room_id))
-        messages_deleted = msg_result.rowcount  # type: ignore[attr-defined]
-
-        # 2. Clear stage_state to minimal metadata
+        # V2 keeps the committed transcript and cursors so completed rooms can be
+        # restored after a refresh. Legacy rooms retain the original destructive
+        # cleanup behavior.
         result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
         room = result.scalar_one_or_none()
         if room is None:
             raise ValueError(f"Room not found: {room_id}")
 
-        # Keep only minimal metadata
         old_state = room.stage_state or {}
-        minimal_state = {
-            "duration_seconds": old_state.get("duration_seconds"),
-            "final_stage": room.current_stage,
-            "cleanup_at": datetime.now(UTC).isoformat(),
-            "activity_version": old_state.get("activity_version"),
-            "template_version": old_state.get("template_version"),
-            "postcard_id": old_state.get("postcard_id"),
-            "processed_command_ids": old_state.get("processed_command_ids", []),
-            "members": old_state.get("members", []),
-            "facilitator": old_state.get("facilitator"),
-            "artwork_path": old_state.get("artwork_path"),
-            "image_status": old_state.get("image_status"),
-            "generation_status": "ready",
-            "current_speaker_id": None,
-        }
-        room.stage_state = minimal_state
+        if str(old_state.get("activity_version")) == "2.0":
+            messages_deleted = 0
+            retained_state = dict(old_state)
+            retained_state.pop("mood", None)
+            retained_state.pop("crisis", None)
+            retained_state.update(
+                final_stage=room.current_stage,
+                cleanup_at=datetime.now(UTC).isoformat(),
+                generation_status="ready",
+                generation_error=None,
+                current_speaker_id=None,
+            )
+            room.stage_state = retained_state
+        else:
+            msg_result = await db.execute(delete(RoomMessage).where(RoomMessage.room_id == room_id))
+            messages_deleted = msg_result.rowcount  # type: ignore[attr-defined]
+            room.stage_state = {
+                "duration_seconds": old_state.get("duration_seconds"),
+                "final_stage": room.current_stage,
+                "cleanup_at": datetime.now(UTC).isoformat(),
+                "activity_version": old_state.get("activity_version"),
+                "template_version": old_state.get("template_version"),
+                "postcard_id": old_state.get("postcard_id"),
+                "processed_command_ids": old_state.get("processed_command_ids", []),
+                "members": old_state.get("members", []),
+                "speaking_order": old_state.get("speaking_order", []),
+                "facilitator": old_state.get("facilitator"),
+                "artwork_path": old_state.get("artwork_path"),
+                "image_status": old_state.get("image_status"),
+                "generation_status": "ready",
+                "current_speaker_id": None,
+            }
 
         # 3. Delete intermediate GeneratedImage records (keep the final completed one)
         # Find the final image (most recent completed)

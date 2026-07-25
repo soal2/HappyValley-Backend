@@ -187,7 +187,12 @@ async def test_tts_route_returns_audio_for_authenticated_user(
     class FakeTtsService:
         async def synthesize(self, **request: str) -> TtsAudio:
             calls.append(request)
-            return TtsAudio(content=b"audio", media_type="audio/mpeg", cache_hit=False)
+            return TtsAudio(
+                content=b"audio",
+                media_type="audio/mpeg",
+                cache_hit=False,
+                duration_ms=1840,
+            )
 
     monkeypatch.setattr("app.routes.tts.get_tts_service", lambda: FakeTtsService())
     response = await client.post(
@@ -204,6 +209,7 @@ async def test_tts_route_returns_audio_for_authenticated_user(
     assert response.status_code == 200
     assert response.content == b"audio"
     assert response.headers["content-type"] == "audio/mpeg"
+    assert response.headers["x-tts-duration-ms"] == "1840"
     assert calls[0]["speaker_id"] == "facilitator"
 
 

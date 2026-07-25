@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from app.agents.http_image import HttpImageGenerator
-from app.agents.http_runtime import HttpAgentRuntime
+from app.agents.http_runtime import HttpAgentRuntime, _parse_json_object
 from app.container import Container
 
 
@@ -213,16 +213,16 @@ async def test_all_visible_text_generators_return_remote_provenance(
         body = request.read().decode()
         request_id = f"remote-{len(request_ids) + 1}"
         request_ids.append(request_id)
-        if "团体带领者小晴" in body:
+        if "温暖开场" in body:
             text = (
-                "我和四位团友都是 AI，这里不是医疗或治疗。你先描述基础画面，"
-                "大家只增加或修饰前一笔，也可以随时退出。"
+                "欢迎大家带着此刻的心情，一起接龙共同完成一幅画。"
+                "结束后会获得专属明信片。现在请小林先来，用文字说说希望出现的画面。"
             )
         elif "文字接龙中的AI团友" in body:
             text = "我为原有画面增加一条穿过草地的温柔溪流，让暖光落在水面上。"
         elif "针对用户刚分享" in body:
             text = "我听见了你的安心，你能辨认并表达这份感受，展现了细腻的自我觉察。"
-        elif "活动的总结者" in body:
+        elif "AI团体带领者小晴" in body:
             text = (
                 '{"summary_text":"大家共同完成了一幅温暖的画。",'
                 '"encouragement_text":"愿你记得这份温暖。"}'
@@ -237,7 +237,7 @@ async def test_all_visible_text_generators_return_remote_provenance(
     monkeypatch.setattr("app.agents.http_runtime.get_settings", _settings)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         runtime = HttpAgentRuntime(client, retry_delay_seconds=0)
-        opening = await runtime.generate_opening([], [])
+        opening = await runtime.generate_opening([], [], {"id": "first", "name": "小林"})
         peer = await runtime.generate_peer_turn({"name": "团友"}, ["一棵树"])
         response = await runtime.generate_facilitator_response("共同画面", "我感到安心")
         summary = await runtime.generate_summary("共同画面", [])
@@ -252,6 +252,25 @@ async def test_all_visible_text_generators_return_remote_provenance(
     ]
     assert all(item is not None and item.source == "remote" for item in metadata)
     assert [item.request_id for item in metadata if item is not None] == request_ids
+
+
+def test_opening_validation_requires_v2_flow_and_assigned_first_speaker() -> None:
+    HttpAgentRuntime._validate_opening(
+        "欢迎一起共同完成一幅画，结束后会获得明信片。现在请小林先来。",
+        "小林",
+    )
+
+    with pytest.raises(ValueError, match="活动流程信息"):
+        HttpAgentRuntime._validate_opening(
+            "欢迎一起共同完成一幅画，结束后会获得明信片。现在请小周先来。",
+            "小林",
+        )
+
+
+def test_model_json_object_accepts_markdown_fence_but_rejects_plain_text() -> None:
+    assert _parse_json_object('```json\n{"text":"温暖"}\n```') == {"text": "温暖"}
+    with pytest.raises(ValueError, match="结构化 JSON"):
+        _parse_json_object("我感到温暖")
 
 
 async def test_image_adapter_rejects_tiny_placeholder_without_fallback(

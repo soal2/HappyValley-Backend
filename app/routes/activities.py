@@ -32,6 +32,12 @@ async def start_activity(
 ) -> StartActivityResponse:
     active_room = await room_service.get_active_room_for_user(user.id, db)
     if active_room is not None:
+        if str((active_room.stage_state or {}).get("activity_version")) != "2.0":
+            await activity_service.terminate_legacy_room_for_upgrade(
+                active_room, db, Container.get().media_storage
+            )
+            await queue_service.release_capacity(db)
+            raise HTTPException(status_code=409, detail="flow_upgraded")
         return StartActivityResponse(status="started", room_id=active_room.id)
     claim, position = await queue_service.claim_or_queue(user.id, request.mood, db)
     if claim == "queued":
@@ -81,6 +87,12 @@ async def active_room_snapshot(
     room = await room_service.get_active_room_for_user(user.id, db)
     if room is None:
         raise HTTPException(status_code=404, detail="当前没有进行中的活动")
+    if str((room.stage_state or {}).get("activity_version")) != "2.0":
+        await activity_service.terminate_legacy_room_for_upgrade(
+            room, db, Container.get().media_storage
+        )
+        await queue_service.release_capacity(db)
+        raise HTTPException(status_code=409, detail="flow_upgraded")
     return RoomSnapshotResponse(**await room_service.get_room_snapshot(room.id, user.id, db))
 
 
@@ -90,6 +102,13 @@ async def room_snapshot(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> RoomSnapshotResponse:
+    room = await room_service.get_room(room_id, user.id, db)
+    if room.status == "active" and str((room.stage_state or {}).get("activity_version")) != "2.0":
+        await activity_service.terminate_legacy_room_for_upgrade(
+            room, db, Container.get().media_storage
+        )
+        await queue_service.release_capacity(db)
+        raise HTTPException(status_code=409, detail="flow_upgraded")
     return RoomSnapshotResponse(**await room_service.get_room_snapshot(room_id, user.id, db))
 
 

@@ -1,7 +1,7 @@
 """SQLAlchemy models for activity rooms and messages."""
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
@@ -54,9 +54,13 @@ class RoomMessage(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     stage: Mapped[str] = mapped_column(String(50), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
     )
     is_crisis: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     generation_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    speech_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (Index("ix_room_messages_room_created", "room_id", "created_at"),)

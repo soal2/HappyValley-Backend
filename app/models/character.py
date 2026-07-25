@@ -26,6 +26,7 @@ class Character(Base):
     system_prompt_template: Mapped[str | None] = mapped_column(Text, nullable=True)
     config_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
     fictional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mbti: Mapped[str | None] = mapped_column(String(4), nullable=True)
     appearance_id: Mapped[str] = mapped_column(String(100), nullable=False)
 
     __table_args__ = (UniqueConstraint("name", "era", name="uq_character_name_era"),)

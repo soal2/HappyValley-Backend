@@ -1,16 +1,21 @@
 """ElevenLabs TTS adapter with server-owned character voices and ephemeral caching."""
 
 import hashlib
+import io
 import json
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import httpx
 import structlog
+from mutagen.mp3 import MP3
 
 from app.config import get_settings
+
+if TYPE_CHECKING:
+    from app.services.edge_tts_service import EdgeTtsService
 
 logger = structlog.get_logger()
 VOICE_PROFILE_VERSION = "elevenlabs-multilingual-v1"
@@ -47,6 +52,7 @@ class TtsAudio:
     content: bytes
     media_type: str
     cache_hit: bool
+    duration_ms: int | None = None
 
 
 class TtsServiceError(Exception):
@@ -55,6 +61,15 @@ class TtsServiceError(Exception):
         self.status_code = status_code
         self.code = code
         self.detail = detail
+
+
+def mp3_duration_ms(content: bytes) -> int | None:
+    try:
+        audio = MP3(io.BytesIO(content))  # type: ignore[no-untyped-call]
+        length = getattr(audio.info, "length", None)
+        return round(float(length) * 1000) if length is not None else None
+    except Exception:
+        return None
 
 
 VOICE_PROFILES: dict[str, VoiceProfile] = {
@@ -150,7 +165,12 @@ class ElevenLabsTtsService:
                 char_count=len(text),
                 cache_hit=True,
             )
-            return TtsAudio(content=cached, media_type="audio/mpeg", cache_hit=True)
+            return TtsAudio(
+                content=cached,
+                media_type="audio/mpeg",
+                cache_hit=True,
+                duration_ms=mp3_duration_ms(cached),
+            )
 
         payload: dict[str, object] = {
             "text": text,
@@ -221,7 +241,12 @@ class ElevenLabsTtsService:
             duration_ms=round((time.perf_counter() - started) * 1000),
             cache_hit=False,
         )
-        return TtsAudio(content=response.content, media_type=media_type, cache_hit=False)
+        return TtsAudio(
+            content=response.content,
+            media_type=media_type,
+            cache_hit=False,
+            duration_ms=mp3_duration_ms(response.content),
+        )
 
     def _cache_key(
         self,
@@ -279,13 +304,20 @@ class ElevenLabsTtsService:
         )
 
 
-_tts_service: ElevenLabsTtsService | None = None
+_tts_service: "ElevenLabsTtsService | EdgeTtsService | None" = None
 
 
-def get_tts_service() -> ElevenLabsTtsService:
+def get_tts_service() -> "ElevenLabsTtsService | EdgeTtsService":
     global _tts_service
     if _tts_service is None:
-        _tts_service = ElevenLabsTtsService(get_settings())
+        settings = get_settings()
+        provider = settings.TTS_PROVIDER.lower()
+        if provider == "edge":
+            from app.services.edge_tts_service import EdgeTtsService
+
+            _tts_service = EdgeTtsService()
+        else:
+            _tts_service = ElevenLabsTtsService(settings)
     return _tts_service
 
 

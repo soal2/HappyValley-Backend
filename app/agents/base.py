@@ -28,6 +28,13 @@ class TextGenerationResult(BaseModel):
     generation: GenerationMeta
 
 
+class ReflectionAnswerResult(BaseModel):
+    text: str = Field(min_length=1)
+    positive_feedback_type: str
+    referenced_message_ids: list[str] = Field(default_factory=list)
+    generation: GenerationMeta
+
+
 class ImageResult(BaseModel):
     data: bytes | None = None
     status: str  # "completed" | "failed"
@@ -43,7 +50,11 @@ class AgentRuntime(ABC):
 
     @abstractmethod
     async def generate_opening(
-        self, members: list[dict[str, object]], activity_rules: list[str]
+        self,
+        members: list[dict[str, object]],
+        activity_rules: list[str],
+        first_speaker: dict[str, object],
+        max_duration_seconds: int = 20,
     ) -> TextGenerationResult: ...
 
     @abstractmethod
@@ -51,6 +62,7 @@ class AgentRuntime(ABC):
         self,
         character: dict[str, object],
         previous_contributions: list[str],
+        max_duration_seconds: int = 10,
     ) -> TextGenerationResult: ...
 
     @abstractmethod
@@ -59,8 +71,31 @@ class AgentRuntime(ABC):
     ) -> TextGenerationResult: ...
 
     @abstractmethod
+    async def generate_reflection_question(
+        self,
+        question_index: int,
+        intent: str,
+        context: str,
+        transcript: list[dict[str, object]],
+        max_duration_seconds: int = 10,
+    ) -> TextGenerationResult: ...
+
+    @abstractmethod
+    async def generate_reflection_answer(
+        self,
+        character: dict[str, object],
+        question: str,
+        context: str,
+        transcript: list[dict[str, object]],
+        max_duration_seconds: int = 10,
+    ) -> ReflectionAnswerResult: ...
+
+    @abstractmethod
     async def generate_summary(
-        self, context: str, transcript: list[dict[str, object]]
+        self,
+        context: str,
+        transcript: list[dict[str, object]],
+        max_duration_seconds: int = 20,
     ) -> SummaryResult: ...
 
     @abstractmethod

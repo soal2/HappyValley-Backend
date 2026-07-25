@@ -18,7 +18,12 @@ class ConnectionManager:
             previous = self._connections.get(room_id)
             self._connections[room_id] = websocket
         if previous is not None and previous is not websocket:
-            await previous.close(code=4001, reason="同一账户已在新设备接管此活动")
+            try:
+                await previous.close(code=4001, reason="同一账户已在新设备接管此活动")
+            except RuntimeError:
+                # A reconnect may race with the old socket's own close frame.
+                # The new socket already owns the room, so the stale close is done.
+                pass
 
     async def disconnect(self, room_id: str, websocket: WebSocket) -> bool:
         """Remove only the current socket; return false for a replaced old socket."""

@@ -17,6 +17,8 @@ dependencies = [
     "python-dotenv",
     "pyyaml",
     "structlog",
+    "edge-tts",
+    "mutagen",
 ]
 
 [project.optional-dependencies]

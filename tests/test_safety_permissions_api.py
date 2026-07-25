@@ -14,44 +14,49 @@ async def _start(client: AsyncClient, username: str) -> tuple[str, dict[str, str
     _, headers = await register_user(client, username)
     response = await client.post("/api/activities", headers=headers, json={"mood": "今天想画画"})
     room_id = response.json()["room_id"]
-    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
-    skipped = await client.post(
-        f"/api/rooms/{room_id}/commands",
-        headers=headers,
-        json={
-            "command_id": f"intro-{username}",
-            "type": "skip_current_stage",
-            "payload": {
-                "expected_stage": snapshot["stage"],
-                "expected_revision": snapshot["revision"],
-            },
-        },
-    )
-    assert skipped.status_code == 200, skipped.text
     return room_id, headers
 
 
 async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) -> str:
-    await client.post(
+    initial = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    painted = await client.post(
         f"/api/rooms/{room_id}/commands",
         headers=headers,
         json={
-            "command_id": "base",
-            "type": "submit_base",
-            "payload": {"text": "海边的一棵树"},
+            "command_id": "painting",
+            "type": "submit_painting_turn",
+            "payload": {
+                "turn_index": initial["stage_state"]["painting_turn_index"],
+                "text": "海边的一棵树",
+            },
         },
     )
-    await client.post(
+    current = painted.json()["snapshot"]
+    revealed = await client.post(
         f"/api/rooms/{room_id}/commands",
         headers=headers,
         json={
-            "command_id": "share",
-            "type": "submit_sharing",
-            "payload": {"text": "海风让我放松"},
+            "command_id": "reveal",
+            "type": "complete_artwork_reveal",
+            "payload": {"expected_revision": current["revision"]},
         },
     )
-    completed = await client.get(f"/api/rooms/{room_id}", headers=headers)
-    return completed.json()["stage_state"]["postcard_id"]
+    current = revealed.json()["snapshot"]
+    for round_index in range(4):
+        answered = await client.post(
+            f"/api/rooms/{room_id}/commands",
+            headers=headers,
+            json={
+                "command_id": f"reflection-{round_index}",
+                "type": "submit_reflection",
+                "payload": {
+                    "round_index": round_index,
+                    "text": f"第 {round_index + 1} 轮里，海风让我感到放松",
+                },
+            },
+        )
+        current = answered.json()["snapshot"]
+    return current["stage_state"]["postcard_id"]
 
 
 async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: AsyncClient) -> None:
@@ -62,13 +67,18 @@ async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: Async
         headers=headers,
         json={
             "command_id": "crisis-1",
-            "type": "submit_base",
-            "payload": {"text": crisis_text},
+            "type": "submit_painting_turn",
+            "payload": {
+                "turn_index": (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()[
+                    "stage_state"
+                ]["painting_turn_index"],
+                "text": crisis_text,
+            },
         },
     )
     assert blocked.status_code == 200
     snapshot = blocked.json()["snapshot"]
-    assert snapshot["stage"] == "HUMAN_BASE_PAINTING"
+    assert snapshot["stage"] == "PAINTING_TURN"
     assert snapshot["stage_state"]["crisis"]["crisis_triggered"] is True
     assert crisis_text not in str(snapshot)
     assert all(message["text"] != crisis_text for message in snapshot["messages"])
@@ -88,22 +98,29 @@ async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: Async
         headers=headers,
         json={
             "command_id": "base-safe",
-            "type": "submit_base",
-            "payload": {"text": "窗边的一盆绿植"},
+            "type": "submit_painting_turn",
+            "payload": {
+                "turn_index": snapshot["stage_state"]["painting_turn_index"],
+                "text": "窗边的一盆绿植",
+            },
         },
     )
-    assert safe.json()["snapshot"]["stage"] == "HUMAN_SHARING"
+    assert safe.json()["snapshot"]["stage"] == "ARTWORK_REVEAL"
 
 
 async def test_crisis_wait_timeout_terminates_without_postcard(client: AsyncClient) -> None:
     room_id, headers = await _start(client, "危机等待")
+    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
     await client.post(
         f"/api/rooms/{room_id}/commands",
         headers=headers,
         json={
             "command_id": "crisis",
-            "type": "submit_base",
-            "payload": {"text": "我想自伤"},
+            "type": "submit_painting_turn",
+            "payload": {
+                "turn_index": snapshot["stage_state"]["painting_turn_index"],
+                "text": "我想自伤",
+            },
         },
     )
     await client.post(

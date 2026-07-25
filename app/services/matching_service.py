@@ -46,6 +46,7 @@ async def sync_characters(db: AsyncSession, path: str | None = None) -> int:
         character.system_prompt_template = entry.get("system_prompt_template")
         character.config_version = version
         character.fictional = "虚构" in entry["era"]
+        character.mbti = entry.get("mbti")
         character.appearance_id = entry.get("appearance_id", f"ai_character_{index + 1:02d}")
     await db.flush()
     return len(entries)
@@ -58,9 +59,13 @@ def _public_character(character: Character, reason: str) -> dict[str, Any]:
         "era": character.era,
         "role": character.personality_type,
         "fictional": character.fictional,
+        "mbti": character.mbti,
         "appearance_id": character.appearance_id,
         "config_version": character.config_version,
         "match_reason": reason,
+        "speak_style": character.speak_style,
+        "facts_boundaries": character.facts_boundaries,
+        "system_prompt_template": character.system_prompt_template,
     }
 
 
@@ -131,6 +136,7 @@ class MatchingService:
                 system_prompt_template=entry.get("system_prompt_template"),
                 config_version=version,
                 fictional="虚构" in entry["era"],
+                mbti=entry.get("mbti"),
                 appearance_id=entry.get("appearance_id", f"ai_character_{index + 1:02d}"),
             )
             for index, entry in enumerate(entries)

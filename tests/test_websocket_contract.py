@@ -45,7 +45,8 @@ async def test_websocket_requires_owner_jwt_and_restores_snapshot(client: AsyncC
         with sync_client.websocket_connect(f"/api/rooms/{room_id}/ws?token={token}") as resumed:
             snapshot = resumed.receive_json()
             assert snapshot["type"] == "snapshot"
-            assert snapshot["data"]["stage"] == "AI_INTRO"
+            assert snapshot["data"]["stage"] == "PAINTING_TURN"
+            assert snapshot["data"]["stage_state"]["activity_version"] == "2.0"
 
         with sync_client.websocket_connect(f"/api/rooms/{room_id}/ws?token={token}") as old:
             assert old.receive_json()["type"] == "snapshot"

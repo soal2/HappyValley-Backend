@@ -60,7 +60,7 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
     result = await db.execute(
         select(RoomMessage)
         .where(RoomMessage.room_id == room_id)
-        .order_by(RoomMessage.created_at.asc())
+        .order_by(RoomMessage.created_at.asc(), RoomMessage.id.asc())
     )
     messages = result.scalars().all()
     messages_data = [
@@ -72,6 +72,7 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
             "stage": msg.stage,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "generation": msg.generation_meta,
+            "speech": msg.speech_meta,
         }
         for msg in messages
     ]
@@ -94,6 +95,12 @@ def _public_stage_state(room: ActivityRoom) -> dict[str, Any]:
         "activity_version",
         "template_version",
         "members",
+        "speaking_order",
+        "painting_turn_index",
+        "reflection_round_index",
+        "reflection_turn_index",
+        "reflection_rounds",
+        "artwork_reveal_status",
         "facilitator",
         "contributions",
         "current_speaker_id",

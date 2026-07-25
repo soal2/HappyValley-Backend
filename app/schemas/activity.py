@@ -36,6 +36,10 @@ class RoomCommandRequest(BaseModel):
     type: Literal[
         "submit_base",
         "submit_sharing",
+        "submit_painting_turn",
+        "complete_artwork_reveal",
+        "submit_reflection",
+        "skip_reflection",
         "answer_follow_up",
         "skip_follow_up",
         "skip_current_stage",

@@ -6,6 +6,7 @@ from app.agents.base import (
     AgentRuntime,
     GenerationMeta,
     RankedMatch,
+    ReflectionAnswerResult,
     SummaryResult,
     TextGenerationResult,
 )
@@ -65,12 +66,16 @@ class FakeAgentRuntime(AgentRuntime):
         )
 
     async def generate_opening(
-        self, members: list[dict[str, object]], activity_rules: list[str]
+        self,
+        members: list[dict[str, object]],
+        activity_rules: list[str],
+        first_speaker: dict[str, object],
+        max_duration_seconds: int = 20,
     ) -> TextGenerationResult:
         self._record("opening")
         return self._text(
-            "欢迎来到绘画小屋。我和四位团友都是 AI，这里是游戏化心理互助体验，"
-            "不能替代心理咨询或治疗。请只增加或修饰前面的画面，你也可以随时退出。",
+            "欢迎大家带着各自的心情来到绘画疗愈空间。我们会用接龙共同完成一幅画，"
+            f"结束后你将获得专属明信片。请{first_speaker['name']}先用文字描述希望画面出现的样子。",
             "fake-opening",
         )
 
@@ -78,11 +83,12 @@ class FakeAgentRuntime(AgentRuntime):
         self,
         character: dict[str, object],
         previous_contributions: list[str],
+        max_duration_seconds: int = 10,
     ) -> TextGenerationResult:
         self._record("peer_turn")
         logger.info("fake_runtime.generate_peer_turn", mode="test")
         return self._text(
-            f"{character['name']}为画面增加了一束从云间落下的暖光",
+            f"我想在这幅画上加上一束从云间落下的暖光，照亮{character['name']}身旁的草地",
             f"fake-peer-{character['id']}",
         )
 
@@ -96,8 +102,49 @@ class FakeAgentRuntime(AgentRuntime):
             "fake-facilitator-response",
         )
 
+    async def generate_reflection_question(
+        self,
+        question_index: int,
+        intent: str,
+        context: str,
+        transcript: list[dict[str, object]],
+        max_duration_seconds: int = 10,
+    ) -> TextGenerationResult:
+        self._record("reflection_question")
+        questions = [
+            "看着我们共同完成的画，你此刻有什么感受？",
+            "画下那一笔时，你心里想的是什么，为什么想这样画？",
+            "此刻，你想对其他成员说些什么？",
+            "听完大家的反馈，你现在的心情如何？",
+        ]
+        return self._text(questions[question_index], f"fake-question-{question_index}")
+
+    async def generate_reflection_answer(
+        self,
+        character: dict[str, object],
+        question: str,
+        context: str,
+        transcript: list[dict[str, object]],
+        max_duration_seconds: int = 10,
+    ) -> ReflectionAnswerResult:
+        self._record("reflection_answer")
+        referenced = [str(item["id"]) for item in transcript[-1:] if item.get("id")]
+        return ReflectionAnswerResult(
+            text="看到大家把不同的想法放在一起，我感到很温暖，也得到了一种新的视角。",
+            positive_feedback_type="multiple_perspectives",
+            referenced_message_ids=referenced,
+            generation=GenerationMeta(
+                source="test",
+                model="fake-test-model",
+                request_id=f"fake-reflection-{character['id']}-{len(transcript)}",
+            ),
+        )
+
     async def generate_summary(
-        self, context: str, transcript: list[dict[str, object]]
+        self,
+        context: str,
+        transcript: list[dict[str, object]],
+        max_duration_seconds: int = 20,
     ) -> SummaryResult:
         self._record("summary")
         logger.info("fake_runtime.generate_summary", mode="demo")

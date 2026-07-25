@@ -68,8 +68,11 @@ async def synthesize_speech(
             status_code=error.status_code,
             detail={"code": error.code, "message": error.detail},
         ) from error
+    headers = {"X-TTS-Cache": "HIT" if audio.cache_hit else "MISS"}
+    if audio.duration_ms is not None:
+        headers["X-TTS-Duration-Ms"] = str(audio.duration_ms)
     return Response(
         content=audio.content,
         media_type=audio.media_type,
-        headers={"X-TTS-Cache": "HIT" if audio.cache_hit else "MISS"},
+        headers=headers,
     )

@@ -11,7 +11,7 @@ from app.database import async_session_factory
 from app.models.room import ActivityRoom
 from app.realtime import connection_manager
 from app.schemas.activity import RoomCommandRequest
-from app.services import activity_service, auth_service, room_service
+from app.services import activity_service, auth_service, queue_service, room_service
 
 router = APIRouter()
 
@@ -53,6 +53,16 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
             return
         if room.user_id != user_id:
             await websocket.close(code=4403, reason="无权访问此房间")
+            return
+        if (
+            room.status == "active"
+            and str((room.stage_state or {}).get("activity_version")) != "2.0"
+        ):
+            await activity_service.terminate_legacy_room_for_upgrade(
+                room, db, Container.get().media_storage
+            )
+            await queue_service.release_capacity(db)
+            await websocket.close(code=4410, reason="flow_upgraded")
             return
         await connection_manager.connect(
             room_id,
