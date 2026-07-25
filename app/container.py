@@ -1,4 +1,4 @@
-"""Dependency injection container – creates runtime instances based on config MODE."""
+"""Dependency injection container – creates runtime instances based on AGENT_BACKEND."""
 
 import structlog
 
@@ -21,20 +21,19 @@ class Container:
 
     def __init__(self) -> None:
         settings = get_settings()
-        mode = settings.MODE
+        backend = settings.AGENT_BACKEND
 
-        if mode == "production":
-            logger.info("container.init", mode="production")
+        if backend == "http":
+            logger.info("container.init", backend="http", mode=settings.MODE)
             self.agent_runtime: AgentRuntime = HttpAgentRuntime()
             self.image_generator: ImageGenerator = HttpImageGenerator()
-        elif mode == "test":
-            logger.info("container.init", mode="test")
+        elif backend == "fake":
+            logger.info("container.init", backend="fake", mode=settings.MODE)
             self.agent_runtime = FakeAgentRuntime()
             self.image_generator = FakeImageGenerator()
         else:
-            raise RuntimeError("MODE 只允许 production 或 test；正式流程不提供 Fake/Demo 回退")
+            raise RuntimeError("AGENT_BACKEND 只允许 http 或 fake")
 
-        # Always use local storage
         self.media_storage: MediaStorage = LocalMediaStorage()
 
     @classmethod

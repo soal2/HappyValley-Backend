@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_HOURS: int = 168
     MODE: str = "production"
+    AGENT_BACKEND: Literal["http", "fake"] = "http"
 
     AI_API_KEY: str | None = None
     AI_MODEL: str | None = None
