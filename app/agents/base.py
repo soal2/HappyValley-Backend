@@ -185,6 +185,11 @@ class AgentRuntime(ABC):
         user_profile: dict[str, object],
     ) -> ConceptualPersonaResult: ...
 
+    @abstractmethod
+    async def generate_practice_feedback(
+        self, practice_type: str, content: str
+    ) -> TextGenerationResult: ...
+
 
 class ImageGenerator(ABC):
     @abstractmethod

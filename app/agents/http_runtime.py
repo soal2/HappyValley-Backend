@@ -348,6 +348,32 @@ class HttpAgentRuntime(AgentRuntime):
             raise ValueError("明信片鼓励语不符合格式")
         return result
 
+    async def generate_practice_feedback(
+        self, practice_type: str, content: str
+    ) -> TextGenerationResult:
+        """根据用户写下的感恩信/三件好事，生成一句温暖反馈。"""
+        if practice_type == "gratitude":
+            system_prompt = (
+                "你是心晴谷的AI带领者小晴。用户刚刚写下一封感恩信，"
+                "回想了一个帮助过自己的人。请写1至2句、不超过50个汉字的温暖回应："
+                "先肯定用户愿意表达感恩的勇气，再点出感恩本身带给彼此的温暖力量。"
+                "不得提问，不得诊断、说教、强行积极化或承诺治疗和治愈。"
+                "只输出回应正文，不要引号、标题或列表。"
+            )
+        else:  # three_good_things
+            system_prompt = (
+                "你是心晴谷的AI带领者小晴。用户刚刚写下了今天的三件好事。"
+                "请写1至2句、不超过50个汉字的温暖回应：先肯定用户留心生活中美好瞬间的能力，"
+                "再点出这些小事累积带来的力量。不得提问，不得诊断、说教、"
+                "强行积极化或承诺治疗和治愈。只输出回应正文，不要引号、标题或列表。"
+            )
+        result = await self._call_chat(
+            system_prompt, f"用户写下的内容：\n{content}"
+        )
+        if len(result.text) > 100 or "？" in result.text or "?" in result.text:
+            raise ValueError("练习反馈不符合格式")
+        return result
+
     async def select_team_skeletons(
         self,
         user_mood: str,

@@ -14,6 +14,7 @@ from app.routes.activities import router as activities_router
 from app.routes.auth import router as auth_router
 from app.routes.postcards import router as postcards_router
 from app.routes.meditation_cards import router as meditation_cards_router
+from app.routes.gratitude_cards import router as gratitude_cards_router
 from app.routes.tts import router as tts_router
 from app.routes.websocket import router as websocket_router
 from app.services import character_generation_service
@@ -74,6 +75,7 @@ app.include_router(auth_router, tags=["auth"])
 app.include_router(activities_router, tags=["activities"])
 app.include_router(postcards_router, tags=["postcards"])
 app.include_router(meditation_cards_router, tags=["meditation-cards"])
+app.include_router(gratitude_cards_router, tags=["gratitude-cards"])
 app.include_router(tts_router, tags=["tts"])
 app.include_router(websocket_router, tags=["websocket"])
 

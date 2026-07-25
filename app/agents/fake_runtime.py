@@ -173,6 +173,21 @@ class FakeAgentRuntime(AgentRuntime):
             "fake-postcard",
         )
 
+    async def generate_practice_feedback(
+        self, practice_type: str, content: str
+    ) -> TextGenerationResult:
+        self._record("practice_feedback")
+        logger.info("fake_runtime.generate_practice_feedback", mode="test")
+        if practice_type == "gratitude":
+            return self._text(
+                "愿意把感谢写下来，本身就是一份温柔的力量。",
+                "fake-practice-feedback-gratitude",
+            )
+        return self._text(
+            "能留心这些小小的亮光，心也会被慢慢照亮。",
+            "fake-practice-feedback-three-good-things",
+        )
+
     async def select_team_skeletons(
         self,
         user_mood: str,
