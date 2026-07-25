@@ -25,7 +25,7 @@ COPY alembic ./alembic
 COPY alembic.ini ./
 COPY config ./config
 COPY scripts ./scripts
-COPY media ./media
+RUN mkdir -p /app/media
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
