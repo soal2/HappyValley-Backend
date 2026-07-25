@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.media.storage import MediaStorage
 from app.models.postcard import GeneratedImage
 from app.models.room import ActivityRoom, RoomMessage
+from app.models.room_character import RoomCharacter
 
 logger = structlog.get_logger()
 
@@ -33,6 +34,12 @@ class CleanupService:
         # V2 keeps the committed transcript and cursors so completed rooms can be
         # restored after a refresh. Legacy rooms retain the original destructive
         # cleanup behavior.
+        # Room character personas (sensitive data) are always deleted regardless
+        # of activity version — they exist only to serve the live relay.
+        char_result = await db.execute(
+            delete(RoomCharacter).where(RoomCharacter.room_id == room_id)
+        )
+        characters_deleted = char_result.rowcount  # type: ignore[attr-defined]
         result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
         room = result.scalar_one_or_none()
         if room is None:
@@ -115,6 +122,7 @@ class CleanupService:
         summary = {
             "room_id": room_id,
             "messages_deleted": messages_deleted,
+            "characters_deleted": characters_deleted,
             "images_deleted": images_deleted,
             "final_image_kept": final_image_id,
             "status": "completed",
@@ -138,6 +146,12 @@ class CleanupService:
         # 1. Delete all room messages
         msg_result = await db.execute(delete(RoomMessage).where(RoomMessage.room_id == room_id))
         messages_deleted = msg_result.rowcount  # type: ignore[attr-defined]
+
+        # 1b. Delete all room character personas (sensitive persona data)
+        char_result = await db.execute(
+            delete(RoomCharacter).where(RoomCharacter.room_id == room_id)
+        )
+        characters_deleted = char_result.rowcount  # type: ignore[attr-defined]
 
         # 2. Clear stage_state
         room_result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
@@ -174,6 +188,7 @@ class CleanupService:
         summary = {
             "room_id": room_id,
             "messages_deleted": messages_deleted,
+            "characters_deleted": characters_deleted,
             "images_deleted": images_deleted,
             "status": "terminated",
         }
@@ -195,6 +210,12 @@ class CleanupService:
         )
         remaining_messages = messages_result.scalars().all()
 
+        # Check no room character personas remain
+        characters_result = await db.execute(
+            select(RoomCharacter).where(RoomCharacter.room_id == room_id)
+        )
+        remaining_characters = characters_result.scalars().all()
+
         # Check stage_state
         room_result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
         room = room_result.scalar_one_or_none()
@@ -213,8 +234,14 @@ class CleanupService:
             "room_id": room_id,
             "messages_remaining": len(remaining_messages),
             "messages_clean": len(remaining_messages) == 0,
+            "characters_remaining": len(remaining_characters),
+            "characters_clean": len(remaining_characters) == 0,
             "sensitive_keys_found": has_sensitive,
             "state_clean": len(has_sensitive) == 0,
-            "overall_clean": len(remaining_messages) == 0 and len(has_sensitive) == 0,
+            "overall_clean": (
+                len(remaining_messages) == 0
+                and len(remaining_characters) == 0
+                and len(has_sensitive) == 0
+            ),
         }
         return verification

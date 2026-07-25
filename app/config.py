@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     CHARACTERS_CONFIG_PATH: str = "config/characters.yaml"
     ACTIVITY_CONFIG_PATH: str = "config/painting_activity.yaml"
     CRISIS_CONFIG_PATH: str = "config/crisis_keywords.yaml"
+    MBTI_APPEARANCE_CONFIG_PATH: str = "config/mbti_appearance.yaml"
+    CHARACTER_GENERATION_MODE: Literal["dynamic", "fixed"] = "dynamic"
+    CHARACTER_GENERATION_TIMEOUT_SECONDS: float = 15.0
+    CHARACTER_GENERATION_WAIT_SECONDS: float = 5.0
+    CHARACTER_GENERATION_STALE_SECONDS: float = 30.0
 
     MEDIA_STORAGE_PATH: str = "./media"
     CORS_ORIGINS: str = "http://localhost:5173"

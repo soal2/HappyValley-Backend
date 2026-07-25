@@ -7,10 +7,12 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.domain.activity_states import ActivityStage, RoomStatus
 from app.domain.room_lock import room_lock_manager
 from app.domain.state_machine import advance_stage
 from app.models.room import ActivityRoom, RoomMessage
+from app.models.room_character import RoomCharacter
 
 
 async def create_room(
@@ -77,10 +79,39 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
         for msg in messages
     ]
 
+    public_state = _public_stage_state(room)
+
+    # Dynamic mode: merge latest display fields from room_characters so the
+    # snapshot reflects fallback name/era/mbti changes. After cleanup (rows
+    # deleted) the skeleton values from stage_state are retained.
+    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
+        char_result = await db.execute(
+            select(RoomCharacter).where(RoomCharacter.room_id == room_id)
+        )
+        char_by_id = {rc.id: rc for rc in char_result.scalars()}
+        members = list(public_state.get("members") or [])
+        for index, member in enumerate(members):
+            if member.get("type") != "ai_peer":
+                continue
+            rc = char_by_id.get(member.get("id"))
+            if rc is None:
+                continue
+            members[index] = {
+                **member,
+                "name": rc.name,
+                "era": rc.era,
+                "mbti": rc.mbti,
+                "role": rc.role,
+                "appearance_id": rc.appearance_id,
+                "source": rc.source,
+                "persona_status": rc.status,
+            }
+        public_state["members"] = members
+
     return {
         "room_id": room.id,
         "stage": room.current_stage,
-        "stage_state": _public_stage_state(room),
+        "stage_state": public_state,
         "status": room.status,
         "revision": room.revision,
         "messages": messages_data,

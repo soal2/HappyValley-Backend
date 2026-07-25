@@ -48,6 +48,10 @@ async def test_started_room_has_rule_legal_ai_team(client: AsyncClient) -> None:
 async def test_activity_uses_rule_order_when_remote_ranking_is_unavailable(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "CHARACTER_GENERATION_MODE", "fixed")
+
     class UnavailableRankingRuntime(FakeAgentRuntime):
         async def rank_candidates(
             self, user_mood: str, user_age: int, candidates: list[dict[str, object]]
@@ -75,6 +79,10 @@ async def test_activity_uses_rule_order_when_remote_ranking_is_unavailable(
 async def test_activity_uses_rule_order_when_remote_ranking_is_invalid(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "CHARACTER_GENERATION_MODE", "fixed")
+
     class InvalidRankingRuntime(FakeAgentRuntime):
         async def rank_candidates(
             self, user_mood: str, user_age: int, candidates: list[dict[str, object]]

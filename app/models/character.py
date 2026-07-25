@@ -28,5 +28,6 @@ class Character(Base):
     fictional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     mbti: Mapped[str | None] = mapped_column(String(4), nullable=True)
     appearance_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    mbti: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
     __table_args__ = (UniqueConstraint("name", "era", name="uq_character_name_era"),)

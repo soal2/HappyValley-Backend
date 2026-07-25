@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.container import Container
 from app.models.room import ActivityRoom
-from app.services import queue_service
+from app.services import character_generation_service, queue_service
 from app.services.cleanup_service import CleanupService
 
 
@@ -37,5 +37,10 @@ async def maintain_runtime_state(db: AsyncSession, *, startup: bool = False) -> 
         room.stage_state = state
         await CleanupService.cleanup_terminated_room(room.id, db, Container.get().media_storage)
         terminated += 1
+
+    # Recover room_characters stuck in skeleton/generating past the deadline
+    # (e.g. after a process restart killed the background Stage B task).
+    await character_generation_service.cleanup_stale_generations(db)
+
     await queue_service.maintain(db)
     return terminated

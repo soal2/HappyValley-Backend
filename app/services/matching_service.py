@@ -22,7 +22,15 @@ def _load_config(path: str | None = None) -> tuple[str, list[dict[str, Any]]]:
     config_path = Path(path or get_settings().CHARACTERS_CONFIG_PATH)
     with config_path.open(encoding="utf-8") as config_file:
         raw = yaml.safe_load(config_file)
-    return str(raw["version"]), list(raw["characters"])
+    if "whitelist" in raw or "conceptual_fallback" in raw:
+        entries = list(raw.get("whitelist", [])) + list(raw.get("conceptual_fallback", []))
+    else:
+        entries = list(raw.get("characters", []))
+    return str(raw["version"]), entries
+
+
+def _appearance_for_mbti(mbti: str | None, fallback: str) -> str:
+    return f"mbti_{mbti.lower()}" if mbti else fallback
 
 
 async def sync_characters(db: AsyncSession, path: str | None = None) -> int:
@@ -47,7 +55,9 @@ async def sync_characters(db: AsyncSession, path: str | None = None) -> int:
         character.config_version = version
         character.fictional = "虚构" in entry["era"]
         character.mbti = entry.get("mbti")
-        character.appearance_id = entry.get("appearance_id", f"ai_character_{index + 1:02d}")
+        character.appearance_id = _appearance_for_mbti(
+            character.mbti, entry.get("appearance_id", f"ai_character_{index + 1:02d}")
+        )
     await db.flush()
     return len(entries)
 
@@ -137,7 +147,9 @@ class MatchingService:
                 config_version=version,
                 fictional="虚构" in entry["era"],
                 mbti=entry.get("mbti"),
-                appearance_id=entry.get("appearance_id", f"ai_character_{index + 1:02d}"),
+                appearance_id=_appearance_for_mbti(
+                    entry.get("mbti"), entry.get("appearance_id", f"ai_character_{index + 1:02d}")
+                ),
             )
             for index, entry in enumerate(entries)
         ]

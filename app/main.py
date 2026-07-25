@@ -16,6 +16,7 @@ from app.routes.postcards import router as postcards_router
 from app.routes.meditation_cards import router as meditation_cards_router
 from app.routes.tts import router as tts_router
 from app.routes.websocket import router as websocket_router
+from app.services import character_generation_service
 from app.services.maintenance_service import maintain_runtime_state
 
 logger = structlog.get_logger()
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     maintenance_task.cancel()
     with suppress(asyncio.CancelledError):
         await maintenance_task
+    await character_generation_service.cancel_all()
     logger.info("happyvalley_backend.shutdown")
 
 

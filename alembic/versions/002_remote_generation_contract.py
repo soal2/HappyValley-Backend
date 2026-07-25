@@ -18,7 +18,10 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.add_column("queue_entries", sa.Column("mood", sa.Text(), nullable=True))
     op.execute("UPDATE queue_entries SET mood = '等待后进入活动' WHERE mood IS NULL")
-    op.alter_column("queue_entries", "mood", nullable=False)
+    # SQLite 不支持 ALTER COLUMN ... SET NOT NULL，batch 模式在 SQLite 上以重建表方式实现，
+    # 在 PostgreSQL 上则退化为直接 ALTER，两种后端行为一致。
+    with op.batch_alter_table("queue_entries") as batch_op:
+        batch_op.alter_column("mood", existing_type=sa.Text(), nullable=False)
     op.add_column("room_messages", sa.Column("generation_meta", sa.JSON(), nullable=True))
     op.add_column("generated_images", sa.Column("generation_meta", sa.JSON(), nullable=True))
     op.add_column("postcards", sa.Column("generation_meta", sa.JSON(), nullable=True))

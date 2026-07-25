@@ -1,18 +1,22 @@
 """HTTP-based agent runtime using OpenAI-compatible API."""
 
 import json
+import re
 import uuid
 from urllib.request import getproxies
 
 import httpx
 import structlog
+from pydantic import BaseModel
 
 from app.agents.base import (
     AgentRuntime,
+    ConceptualPersonaResult,
     GenerationMeta,
     RankedMatch,
     ReflectionAnswerResult,
     SummaryResult,
+    TeamSkeletonResult,
     TextGenerationResult,
 )
 from app.config import get_settings
@@ -34,6 +38,23 @@ def _parse_json_object(raw: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("模型未返回要求的 JSON 对象")
     return parsed
+
+
+def _extract_json(text: str) -> str:
+    """Strip markdown code fences and isolate the JSON payload."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("```", 2)[1] if stripped.count("```") >= 2 else stripped
+        stripped = stripped[4:] if stripped.startswith("json") else stripped
+        stripped = stripped.strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+    # Fallback: crop to the outermost JSON object/array if extra prose sneaks in.
+    if not stripped or stripped[0] not in "{[":
+        match = re.search(r"(\{.*\}|\[.*\])", stripped, re.DOTALL)
+        if match:
+            return match.group(1)
+    return stripped
 
 
 class HttpAgentRuntime(AgentRuntime):
@@ -325,6 +346,83 @@ class HttpAgentRuntime(AgentRuntime):
         if len(result.text) > 100 or "？" in result.text or "?" in result.text:
             raise ValueError("明信片鼓励语不符合格式")
         return result
+
+    async def select_team_skeletons(
+        self,
+        user_mood: str,
+        user_age: int,
+        user_profile: dict[str, object],
+        whitelist_candidates: list[dict[str, object]],
+    ) -> TeamSkeletonResult:
+        """Stage A: pick 2 real whitelist characters + generate 2 conceptual skeletons."""
+        system_prompt = (
+            "你是心晴谷绘画疗愈活动的 AI 团友匹配系统。根据用户心情，从白名单真实人物中选 2 位，"
+            "并生成 2 位概念人物（如爱画画的大学生、退休园艺师等），组成 4 人 AI 团友。\n"
+            "硬约束（必须全部满足）：\n"
+            "1. 恰好选 2 位真实人物（id 必须来自 candidates 列表），恰好生成 2 位概念人物。\n"
+            "2. 4 人角色(role)配比必须是：2 位 been-there + 1 位 different-perspective + 1 位 quiet-resonator。"
+            "真实人物的 role 已固定，概念人物的 role 由你分配以补齐这个配比。\n"
+            "3. 4 人的 mbti 必须两两不同（4 种不同 MBTI 类型）。\n"
+            "4. 概念人物：name 简洁（2-4 个汉字），era 简短（如'当代'），one_line_concept 不超过 30 字。\n"
+            "5. 概念人物的 mbti 不得与两位真实人物的 mbti 重复。\n"
+            '只返回 JSON，不要任何解释：{"real_character_ids": ["id1", "id2"], '
+            '"conceptuals": [{"name": "...", "era": "...", "mbti": "INTJ", '
+            '"role": "been-there", "one_line_concept": "..."}, ...]}'
+        )
+        user_msg = json.dumps(
+            {
+                "user_mood": user_mood,
+                "user_age": user_age,
+                "user_profile": user_profile,
+                "candidates": whitelist_candidates,
+            },
+            ensure_ascii=False,
+        )
+        result = await self._call_chat(system_prompt, user_msg)
+        parsed = json.loads(_extract_json(result.text))
+        return TeamSkeletonResult(**parsed)
+
+    async def generate_conceptual_persona(
+        self,
+        skeleton: dict[str, object],
+        user_mood: str,
+        user_profile: dict[str, object],
+    ) -> ConceptualPersonaResult:
+        """Stage B: generate full 5-dimension persona for a conceptual character."""
+        system_prompt = (
+            "你是心晴谷的概念人物人格设计师。根据概念骨架和用户心情，按 5 维人格框架生成完整人格，"
+            "并组装可直接用于接龙的 persona 字段。\n"
+            "5 维说明：\n"
+            "- big_five: openness/conscientiousness/extraversion/agreeableness/neuroticism，"
+            "各为 0-1 之间的浮点数。\n"
+            "- cognitive_style: decision_making（决策方式）和 risk_taking（风险倾向），均为简短描述。\n"
+            "- motivation: intrinsic（内在动机列表）和 extrinsic（外在动机列表）。\n"
+            "- expression_style: sentence_length/humor/metaphor_frequency，均为简短描述。\n"
+            "- historical_context: era/profession/cultural_background 为字符串，key_events 为事件列表。\n"
+            "同时生成：\n"
+            "- system_prompt_template: 角色系统提示词，含身份、经历、回应风格约束（不超过150字）。\n"
+            "- speak_style: 说话风格描述。\n"
+            "- facts_boundaries: 事实边界，该角色可涉及与不可涉及的内容。\n"
+            "- safety_fallback: 安全兜底回应，必须包含引导寻求专业帮助的语句。\n"
+            "- topics: 适合话题列表（3-5 个）。\n"
+            "安全要求：safety_fallback 和 facts_boundaries 必须非空；不得鼓励自伤、暴力或放弃求助。\n"
+            "只返回 JSON，不要解释，结构对齐：{\n"
+            '  "five_dim": {"big_five": {...}, "cognitive_style": {...}, "motivation": {...}, '
+            '"expression_style": {...}, "historical_context": {...}},\n'
+            '  "system_prompt_template": "...", "speak_style": "...", "facts_boundaries": "...",\n'
+            '  "safety_fallback": "...", "topics": ["..."], "generation": {"source": "remote", '
+            '"model": "...", "request_id": "..."}\n'
+            "}（generation 字段可省略，由系统填充）"
+        )
+        user_msg = json.dumps(
+            {"skeleton": skeleton, "user_mood": user_mood, "user_profile": user_profile},
+            ensure_ascii=False,
+        )
+        result = await self._call_chat(system_prompt, user_msg)
+        parsed = json.loads(_extract_json(result.text))
+        if "generation" not in parsed:
+            parsed["generation"] = result.generation.model_dump()
+        return ConceptualPersonaResult(**parsed)
 
     @staticmethod
     def _validate_opening(text: str, first_speaker_name: str) -> None:

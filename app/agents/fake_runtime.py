@@ -4,10 +4,19 @@ import structlog
 
 from app.agents.base import (
     AgentRuntime,
+    BigFive,
+    CognitiveStyle,
+    ConceptualPersonaResult,
+    ConceptualSkeleton,
+    ExpressionStyle,
+    FiveDimPersona,
     GenerationMeta,
+    HistoricalContext,
+    Motivation,
     RankedMatch,
     ReflectionAnswerResult,
     SummaryResult,
+    TeamSkeletonResult,
     TextGenerationResult,
 )
 
@@ -162,4 +171,95 @@ class FakeAgentRuntime(AgentRuntime):
         return self._text(
             "愿这张明信片提醒你，你一直拥有发现微光的能力。",
             "fake-postcard",
+        )
+
+    async def select_team_skeletons(
+        self,
+        user_mood: str,
+        user_age: int,
+        user_profile: dict[str, object],
+        whitelist_candidates: list[dict[str, object]],
+    ) -> TeamSkeletonResult:
+        """Deterministic Stage A: first 2 whitelist candidates + 2 fixed conceptuals."""
+        self._record("select_team_skeletons")
+        logger.info("fake_runtime.select_team_skeletons", mode="test")
+        real = whitelist_candidates[:2]
+        real_ids = [str(candidate["id"]) for candidate in real]
+        real_roles = [str(candidate.get("role", "been-there")) for candidate in real]
+        used_mbti = {str(candidate.get("mbti", "")) for candidate in real}
+
+        # Complete the 2 been-there + 1 different-perspective + 1 quiet-resonator ratio.
+        needed_roles = ["been-there", "been-there", "different-perspective", "quiet-resonator"]
+        for role in real_roles:
+            if role in needed_roles:
+                needed_roles.remove(role)
+        conceptual_roles = needed_roles  # 2 remaining roles
+
+        names = [("星河旅人", "当代"), ("晨雾小鹿", "当代")]
+        mbti_pool = ["INTJ", "ENTJ", "ISTP", "ESFP", "ENTP", "ISFJ", "ESTP", "ENFP"]
+        conceptuals: list[ConceptualSkeleton] = []
+        for index, (name, era) in enumerate(names):
+            mbti = next(mbti for mbti in mbti_pool if mbti not in used_mbti)
+            used_mbti.add(mbti)
+            conceptuals.append(
+                ConceptualSkeleton(
+                    name=name,
+                    era=era,
+                    mbti=mbti,
+                    role=conceptual_roles[index],
+                    one_line_concept=f"一位{conceptual_roles[index]}视角的虚构伙伴（demo）",
+                )
+            )
+        return TeamSkeletonResult(real_character_ids=real_ids, conceptuals=conceptuals)
+
+    async def generate_conceptual_persona(
+        self,
+        skeleton: dict[str, object],
+        user_mood: str,
+        user_profile: dict[str, object],
+    ) -> ConceptualPersonaResult:
+        """Deterministic Stage B: fixed 5-dimension persona for a conceptual character."""
+        self._record("generate_conceptual_persona")
+        logger.info("fake_runtime.generate_conceptual_persona", mode="test")
+        name = str(skeleton.get("name", "概念伙伴"))
+        role = str(skeleton.get("role", "been-there"))
+        return ConceptualPersonaResult(
+            five_dim=FiveDimPersona(
+                big_five=BigFive(
+                    openness=0.75,
+                    conscientiousness=0.6,
+                    extraversion=0.5,
+                    agreeableness=0.8,
+                    neuroticism=0.4,
+                ),
+                cognitive_style=CognitiveStyle(
+                    decision_making="直觉与感受并重",
+                    risk_taking="谨慎但愿意尝试新事物",
+                ),
+                motivation=Motivation(
+                    intrinsic=["对美的追求", "理解他人的渴望"],
+                    extrinsic=["被认可的温暖"],
+                ),
+                expression_style=ExpressionStyle(
+                    sentence_length="简短",
+                    humor="温和",
+                    metaphor_frequency="偶尔",
+                ),
+                historical_context=HistoricalContext(
+                    era=str(skeleton.get("era", "当代")),
+                    profession="艺术爱好者",
+                    cultural_background="现代都市",
+                    key_events=["开始接触绘画疗愈"],
+                ),
+            ),
+            system_prompt_template=(
+                f'你是{name}，一位{role}视角的虚构伙伴。以简短真诚的方式回应，不超过3句话。用"你"称呼对方。'
+            ),
+            speak_style="温和简短，真诚自然。",
+            facts_boundaries=f"虚构角色{name}，不涉及真实历史事件或人物。",
+            safety_fallback="我听到你了。如果此刻很难受，请让专业的人来帮你，这不是软弱。",
+            topics=["创作与感受", "安静的力量", "被理解的温暖"],
+            generation=GenerationMeta(
+                source="test", model="fake-test-model", request_id=f"fake-persona-{name}"
+            ),
         )

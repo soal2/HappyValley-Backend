@@ -26,7 +26,7 @@ from app.media.storage import MediaStorage
 from app.models.postcard import GeneratedImage, Postcard
 from app.models.room import ActivityRoom, RoomMessage
 from app.models.user import User
-from app.services import matching_service, queue_service, room_service
+from app.services import character_generation_service, matching_service, queue_service, room_service
 from app.services.cleanup_service import CleanupService
 from app.services.crisis_service import CrisisService
 from app.services.speech_service import prepare_speech_meta
@@ -71,6 +71,24 @@ def _payload_text(payload: dict[str, Any]) -> str:
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
         raise HTTPException(status_code=422, detail="text 必须是 1 到 4000 字符的文本")
     return text.strip()
+
+
+def _merge_display_fields(
+    member: dict[str, Any], persona: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Merge latest display fields from a persona snapshot into a member dict."""
+    if persona is None:
+        return member
+    return {
+        **member,
+        "name": persona["name"],
+        "era": persona["era"],
+        "mbti": persona["mbti"],
+        "role": persona["role"],
+        "source": persona["source"],
+        "appearance_id": persona["appearance_id"],
+        "persona_status": persona["status"],
+    }
 
 
 def _remember_command(state: dict[str, Any], command_id: str) -> None:
@@ -224,20 +242,14 @@ async def create_activity_room(
     config = _activity_config()
     crisis = await CrisisService.check_message(mood, "pending", user.id, db, persist=False)
     match_mood = "" if crisis else mood
-    peers = await matching_service.match_team_for_user(user.id, match_mood, db, agent_runtime)
-    voice_ids = ["zhu", "xiaoli", "zhang", "li"]
-    members = [_human_member(user)] + [
-        dict(peer, type="ai_peer", voice_id=voice_ids[index]) for index, peer in enumerate(peers)
-    ]
-    speaking_order = [str(member["id"]) for member in members]
-    SystemRandom().shuffle(speaking_order)
+    dynamic = get_settings().CHARACTER_GENERATION_MODE == "dynamic"
     state: dict[str, Any] = {
         "activity_type": config["activity_type"],
         "activity_version": config["version"],
         "template_version": config["postcard"]["template_version"],
         "mood": None if crisis else mood,
-        "members": members,
-        "speaking_order": speaking_order,
+        "members": [],
+        "speaking_order": [],
         "painting_turn_index": 0,
         "reflection_round_index": 0,
         "reflection_turn_index": 0,
@@ -254,7 +266,33 @@ async def create_activity_room(
     }
     if crisis:
         state["crisis"] = crisis
-    room = await room_service.create_room(user.id, db, stage_state=state)
+
+    if dynamic:
+        # Create room first — room_characters FK requires the room to exist.
+        room = await room_service.create_room(user.id, db, stage_state=state)
+        # Stage A: select 2 real + 2 conceptual skeletons, persist to room_characters.
+        member_slots = await character_generation_service.select_and_persist_skeletons(
+            room, user, match_mood, db, agent_runtime
+        )
+        state["members"] = [_human_member(user)] + member_slots
+        room.stage_state = state
+        await db.flush()
+    else:
+        peers = await matching_service.match_team_for_user(user.id, match_mood, db, agent_runtime)
+        voice_ids = ["zhu", "xiaoli", "zhang", "li"]
+        state["members"] = [_human_member(user)] + [
+            dict(peer, type="ai_peer", voice_id=voice_ids[index])
+            for index, peer in enumerate(peers)
+        ]
+        room = await room_service.create_room(user.id, db, stage_state=state)
+
+    # Build speaking order (random shuffle of all member IDs) for v2 flow.
+    speaking_order = [str(member["id"]) for member in state["members"]]
+    SystemRandom().shuffle(speaking_order)
+    state["speaking_order"] = speaking_order
+    room.stage_state = state
+    await db.flush()
+
     if crisis:
         db.add(
             RoomMessage(
@@ -267,8 +305,12 @@ async def create_activity_room(
             )
         )
         await db.flush()
+        await db.commit()
     else:
         opening_ready = await _generate_opening(room, state, db, agent_runtime)
+        if dynamic:
+            # Launch Stage B background persona generation (idempotent).
+            await character_generation_service.start_for_room(room.id)
         if opening_ready:
             await _run_v2_painting_until_human(room, state, db, agent_runtime, None)
     return room
@@ -338,8 +380,18 @@ async def _run_v2_painting_until_human(
     order = [str(member_id) for member_id in state["speaking_order"]]
     contributions = list(state.get("contributions", []))
     index = int(state.get("painting_turn_index", len(contributions)))
+
+    # Stage C: wait for background persona generation, apply fallback, enrich peers.
+    persona_map: dict[str, dict[str, Any]] | None = None
+    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
+        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+
     while index < len(order):
         member = _member_for(state, order[index])
+        if persona_map is not None:
+            persona = persona_map.get(str(member["id"]))
+            if persona is not None:
+                member = character_generation_service.enrich_peer_with_persona(member, persona)
         room.current_stage = "PAINTING_TURN"
         state.update(
             painting_turn_index=index,
@@ -830,10 +882,20 @@ async def _run_relay(
     emit: EventEmitter | None,
 ) -> None:
     peers = [member for member in state["members"] if member["type"] == "ai_peer"]
+
+    # Stage C: wait for background persona generation, apply fallback, enrich peers.
+    persona_map: dict[str, dict[str, Any]] | None = None
+    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
+        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+
     contributions = list(state.get("contributions", []))
     completed_ai = max(0, len(contributions) - 1)
     for index in range(completed_ai, 4):
         peer = peers[index]
+        if persona_map is not None:
+            persona = persona_map.get(str(peer["id"]))
+            if persona is not None:
+                peer = character_generation_service.enrich_peer_with_persona(peer, persona)
         stage = f"AI_TURN_{index + 1}"
         room.current_stage = stage
         state.update(
@@ -1020,6 +1082,17 @@ async def _run_completion(
             room, state, db, emit, "error", error="generation_failed", recoverable=True
         )
         return
+    # Dynamic mode: merge latest display fields (incl. fallback name changes) into
+    # postcard member_data so the saved postcard shows the final teammate names.
+    postcard_members = list(state["members"])
+    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
+        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+        postcard_members = [
+            _merge_display_fields(member, persona_map.get(str(member.get("id"))))
+            if member.get("type") == "ai_peer"
+            else member
+            for member in postcard_members
+        ]
     postcard = Postcard(
         user_id=room.user_id,
         room_id=room.id,
@@ -1028,7 +1101,7 @@ async def _run_completion(
         summary_text=summary_text,
         encouragement_text=postcard_text.text,
         generation_meta=_generation(postcard_text),
-        member_data=list(state["members"]),
+        member_data=postcard_members,
         template_version=str(state["template_version"]),
     )
     db.add(postcard)

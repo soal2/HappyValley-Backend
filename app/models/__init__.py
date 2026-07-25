@@ -5,4 +5,5 @@ from app.models.meditation_card import MeditationCard  # noqa: F401
 from app.models.postcard import GeneratedImage, Postcard  # noqa: F401
 from app.models.queue import QueueEntry  # noqa: F401
 from app.models.room import ActivityRoom, RoomMessage  # noqa: F401
+from app.models.room_character import RoomCharacter  # noqa: F401
 from app.models.user import User, UserProfile  # noqa: F401

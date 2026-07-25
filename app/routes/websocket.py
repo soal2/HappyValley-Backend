@@ -16,14 +16,6 @@ from app.services import activity_service, auth_service, queue_service, room_ser
 router = APIRouter()
 
 
-async def _safe_send(websocket: WebSocket, payload: dict[str, object]) -> bool:
-    try:
-        await websocket.send_json(payload)
-        return True
-    except (RuntimeError, WebSocketDisconnect):
-        return False
-
-
 @router.websocket("/api/rooms/{room_id}/ws")
 async def room_websocket(websocket: WebSocket, room_id: str) -> None:
     requested_protocols = [
@@ -85,20 +77,20 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                 container.media_storage,
             )
             snapshot = await room_service.get_room_snapshot(room_id, user_id, db)
-            if not await _safe_send(websocket, {"type": "snapshot", "data": snapshot}):
+            if not await connection_manager.send_to_room(room_id, {"type": "snapshot", "data": snapshot}):
                 return
         while True:
             raw = await websocket.receive_json()
             try:
                 command = RoomCommandRequest.model_validate(raw)
             except ValidationError as error:
-                await _safe_send(
-                    websocket,
+                await connection_manager.send_to_room(
+                    room_id,
                     {"type": "error", "error": "invalid_command", "detail": error.errors()},
                 )
                 continue
-            if not await _safe_send(
-                websocket,
+            if not await connection_manager.send_to_room(
+                room_id,
                 {"type": "progress", "command_id": command.command_id, "status": "processing"},
             ):
                 return
@@ -107,7 +99,7 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                 try:
 
                     async def emit(event: dict[str, object]) -> None:
-                        await _safe_send(websocket, event)
+                        await connection_manager.send_to_room(room_id, event)
 
                     result = await activity_service.execute_command(
                         room_id,
@@ -123,8 +115,8 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                     )
                     await db.commit()
                     snapshot = await room_service.get_room_snapshot(room_id, user_id, db)
-                    if not await _safe_send(
-                        websocket,
+                    if not await connection_manager.send_to_room(
+                        room_id,
                         {
                             "type": "command_result",
                             "command_id": command.command_id,
@@ -135,8 +127,8 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                         return
                 except Exception as error:
                     await db.rollback()
-                    if not await _safe_send(
-                        websocket,
+                    if not await connection_manager.send_to_room(
+                        room_id,
                         {
                             "type": "error",
                             "command_id": command.command_id,

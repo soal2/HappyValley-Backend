@@ -292,9 +292,9 @@ async def test_image_adapter_rejects_tiny_placeholder_without_fallback(
     assert result.data is None
 
 
-def test_container_rejects_demo_mode_instead_of_loading_fake_fallback(
+def test_container_rejects_invalid_backend_instead_of_loading_fake_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("app.container.get_settings", lambda: SimpleNamespace(MODE="demo"))
-    with pytest.raises(RuntimeError, match="production 或 test"):
+    monkeypatch.setattr("app.container.get_settings", lambda: SimpleNamespace(AGENT_BACKEND="demo"))
+    with pytest.raises(RuntimeError, match="AGENT_BACKEND 只允许 http 或 fake"):
         Container()

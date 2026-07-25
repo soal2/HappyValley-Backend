@@ -1,0 +1,22 @@
+# MBTI → 视觉形象映射
+# 16 种 MBTI 类型各对应一套固定外观素材（前端按 appearance_id 提供素材）。
+# 动态生成的 AI 团友统一按其 MBTI 取外观，不生成图片。
+version: "1.0"
+
+mapping:
+  INTJ: "mbti_intj"
+  INTP: "mbti_intp"
+  INFJ: "mbti_infj"
+  INFP: "mbti_infp"
+  ISTJ: "mbti_istj"
+  ISFJ: "mbti_isfj"
+  ISTP: "mbti_istp"
+  ISFP: "mbti_isfp"
+  ENTJ: "mbti_entj"
+  ENTP: "mbti_entp"
+  ENFJ: "mbti_enfj"
+  ENFP: "mbti_enfp"
+  ESTJ: "mbti_estj"
+  ESFJ: "mbti_esfj"
+  ESTP: "mbti_estp"
+  ESFP: "mbti_esfp"

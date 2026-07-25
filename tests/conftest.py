@@ -12,8 +12,10 @@ TEST_DB_PATH = Path(__file__).parent / "test.db"
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB_PATH}"
 os.environ["SECRET_KEY"] = "test-only-secret"
 os.environ["MODE"] = "test"
+os.environ["AGENT_BACKEND"] = "fake"
 os.environ["MEDIA_STORAGE_PATH"] = str(Path(__file__).parent / "media")
 
+from app.container import Container  # noqa: E402
 from app.database import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -21,6 +23,7 @@ from app.main import app  # noqa: E402
 @pytest.fixture(autouse=True)
 async def clean_database() -> AsyncIterator[None]:
     shutil.rmtree(Path(__file__).parent / "media", ignore_errors=True)
+    Container.reset()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
