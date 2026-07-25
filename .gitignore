@@ -16,8 +16,8 @@ env/
 # Database
 *.db
 
-# Media uploads
-media/
+# Media uploads (only top-level storage; app/media/ is source code)
+/media/
 
 # IDE
 .idea/
