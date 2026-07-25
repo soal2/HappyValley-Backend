@@ -30,6 +30,7 @@ from app.services import character_generation_service, matching_service, queue_s
 from app.services.cleanup_service import CleanupService
 from app.services.crisis_service import CrisisService
 from app.services.speech_service import estimated_duration_ms, prepare_speech_meta, split_speech
+from app.services.text_sanitizer import sanitize_user_text
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 logger = structlog.get_logger()
@@ -70,7 +71,9 @@ def _payload_text(payload: dict[str, Any]) -> str:
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
         raise HTTPException(status_code=422, detail="text 必须是 1 到 4000 字符的文本")
-    return text.strip()
+    # 静默清除脏话/侮辱词：绘画贡献、回顾发言等所有用户文本的唯一入口，
+    # 在入库与喂给文本模型/生图之前净化，避免上游内容审核拒绝（如 451）。
+    return sanitize_user_text(text.strip())
 
 
 def _merge_display_fields(
@@ -603,7 +606,9 @@ async def _complete_v2_activity(
                         break
                     kept_chunks.append(chunk)
                     running_ms += chunk_ms
-                truncated = "".join(kept_chunks) or (candidate.summary_text[:28] if candidate else "")
+                truncated = "".join(kept_chunks) or (
+                    candidate.summary_text[:28] if candidate else ""
+                )
                 summary = SummaryResult(
                     summary_text=truncated,
                     encouragement_text=candidate.encouragement_text if candidate else "",

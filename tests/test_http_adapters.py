@@ -273,12 +273,16 @@ def test_model_json_object_accepts_markdown_fence_but_rejects_plain_text() -> No
         _parse_json_object("我感到温暖")
 
 
-async def test_image_adapter_rejects_tiny_placeholder_without_fallback(
+async def test_image_adapter_returns_fallback_artwork_when_all_attempts_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """审核保底：原始意象与净化重试都拿不到有效图时，回落到兜底安全图（completed）。"""
     tiny = _valid_png(4, 4)
+    calls = 0
 
     def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         return httpx.Response(
             200,
             json={"data": [{"b64_json": base64.b64encode(tiny).decode()}]},
@@ -288,8 +292,47 @@ async def test_image_adapter_rejects_tiny_placeholder_without_fallback(
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await HttpImageGenerator(client, retry_delay_seconds=0).generate("山谷")
 
-    assert result.status == "failed"
-    assert result.data is None
+    # 每级各 1 次退避重试：原始意象 2 次 + 净化重试 2 次 = 4 次上游调用后仍无效。
+    assert calls == 4
+    # 关键契约：绝不落 failed，活动一定拿到可展示插画。
+    assert result.status == "completed"
+    assert result.data is not None
+    assert result.generation is not None
+    assert result.generation.source == "fallback"
+
+
+async def test_image_adapter_sanitizes_prompt_on_retry_after_moderation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审核拒绝（4xx）后，用净化过的安全意象重试并成功返回真实图。"""
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        body = json.loads(request.read().decode())
+        prompts.append(str(body["prompt"]))
+        # 原始意象含敏感词 → 上游连续 4xx 拒绝；净化后（去掉敏感词）→ 放行。
+        if "血腥" in prompts[-1] or "刀" in prompts[-1]:
+            return httpx.Response(400, text="content policy violation")
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(_valid_png()).decode()}]},
+        )
+
+    monkeypatch.setattr("app.agents.http_image.get_settings", _settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HttpImageGenerator(client, retry_delay_seconds=0).generate(
+            "画一把刀和血腥的场景，还有阳光花草"
+        )
+
+    assert result.status == "completed"
+    assert result.generation is not None
+    assert result.generation.source == "remote"
+    # 原始意象被拒（2 次），净化后的意象成功；净化意象里不应再含敏感词。
+    assert any("血腥" not in p and "刀" not in p for p in prompts)
+    # 每次调用都套了治愈系动画风格前缀。
+    assert all("治愈系动画插画风格" in p for p in prompts)
 
 
 def test_container_rejects_invalid_backend_instead_of_loading_fake_fallback(

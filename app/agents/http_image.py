@@ -1,6 +1,9 @@
 """HTTP-based image generator using OpenAI DALL-E compatible API."""
 
+import re
+import struct
 import uuid
+import zlib
 
 import httpx
 import structlog
@@ -9,6 +12,85 @@ from app.agents.base import GenerationMeta, ImageGenerator, ImageResult
 from app.config import get_settings
 
 logger = structlog.get_logger()
+
+# 只出「动画/治愈系插画」风：把用户拼接的画面意象包进统一的风格前后缀，杜绝写实照片/真人。
+STYLE_PREFIX = (
+    "治愈系动画插画风格，柔和水彩质感，温暖明亮的色调，吉卜力/绘本风，cinematic soft lighting，"
+    "healing anime illustration, soft watercolor, warm palette, storybook aesthetic。"
+    "画面主体内容："
+)
+STYLE_SUFFIX = "。整体必须是插画/动画风格，不要写实照片、不要真人。"
+
+# 审核保底：净化时命中即删除的敏感片段（暴力/血腥/露骨/危险等类目的常见词）。
+_UNSAFE_TERMS = (
+    "血",
+    "血腥",
+    "暴力",
+    "杀",
+    "死",
+    "尸",
+    "自杀",
+    "自残",
+    "刀",
+    "枪",
+    "武器",
+    "爆炸",
+    "裸",
+    "裸体",
+    "色情",
+    "性",
+    "毒",
+    "毒品",
+    "恐怖",
+    "仇恨",
+    "歧视",
+    "虐待",
+    "战争",
+)
+# 净化后若为空时的通用安全意象。
+_SAFE_FALLBACK_PROMPT = "温暖治愈的自然风景，阳光、花草、柔和的天空"
+
+
+def _stylize(prompt: str) -> str:
+    """套用治愈系动画风格前后缀。"""
+    return f"{STYLE_PREFIX}{prompt}{STYLE_SUFFIX}"
+
+
+def _sanitize(prompt: str) -> str:
+    """净化用户意象：删掉敏感片段与非常规字符，只留温和的自然意象；空则回退安全意象。"""
+    cleaned = prompt
+    for term in _UNSAFE_TERMS:
+        cleaned = cleaned.replace(term, "")
+    # 只保留中日文、英文字母、数字与常见温和标点，其余（含 emoji/特殊符号）一律去除。
+    cleaned = re.sub(r"[^一-鿿぀-ヿA-Za-z0-9，。、,.\s]", "", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned or _SAFE_FALLBACK_PROMPT
+
+
+def _fallback_artwork_png() -> bytes:
+    """兜底安全图：1024×1024 柔和暖色竖向渐变 PNG（纯 Python 生成，永不依赖外部）。"""
+    width = height = 1024
+    raw = bytearray()
+    for y in range(height):
+        t = y / (height - 1)
+        # 顶部暖桃色 → 底部柔黄绿，营造治愈系晨光基调。
+        r = int(0xF6 + (0xEA - 0xF6) * t)
+        g = int(0xD9 + (0xF0 - 0xD9) * t)
+        b = int(0xC0 + (0xC8 - 0xC0) * t)
+        raw.append(0)  # 每行 filter byte = 0
+        raw.extend(bytes((r, g, b)) * width)
+
+    def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+        body = chunk_type + data
+        crc = struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        return struct.pack(">I", len(data)) + body + crc
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit, color type 2 (RGB)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _chunk(b"IHDR", ihdr)
+    png += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += _chunk(b"IEND", b"")
+    return png
 
 
 class HttpImageGenerator(ImageGenerator):
@@ -28,14 +110,49 @@ class HttpImageGenerator(ImageGenerator):
         self._retry_delay_seconds = retry_delay_seconds
 
     async def generate(self, prompt: str) -> ImageResult:
-        """Generate an image via API with 1 retry. Returns failed on final error."""
+        """三级降级出图，保证活动一定拿到可展示的插画：
+
+        1. 原始意象 + 治愈系动画风格，正常调用（含 1 次退避重试）。
+        2. 上一步失败（含审核拒绝/返回非图/网络错误）→ 净化关键词后再调一次。
+        3. 仍失败 → 返回兜底安全图（status=completed），绝不让绘画疗愈卡在失败态。
+        """
+        # 第一级：原始意象。
+        result = await self._call_api(_stylize(prompt))
+        if result.status == "completed":
+            return result
+
+        # 第二级：净化关键词重试（覆盖审核风险）。
+        sanitized = _sanitize(prompt)
+        logger.warning(
+            "http_image.sanitized_retry",
+            reason=result.error,
+            sanitized_preview=sanitized[:50],
+        )
+        result = await self._call_api(_stylize(sanitized))
+        if result.status == "completed":
+            return result
+
+        # 第三级：兜底安全图，保证流程走完。
+        logger.warning("http_image.fallback_image_used", reason=result.error)
+        return ImageResult(
+            data=_fallback_artwork_png(),
+            status="completed",
+            generation=GenerationMeta(
+                source="fallback",
+                model=self._model,
+                request_id=str(uuid.uuid4()),
+            ),
+        )
+
+    async def _call_api(self, styled_prompt: str) -> ImageResult:
+        """调一次图片 API（含 1 次退避重试）。失败返回 status=failed，不抛异常。"""
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
         payload = {
             "model": self._model,
-            "prompt": prompt,
+            "prompt": styled_prompt,
             "n": 1,
             "size": "1024x1024",
             "response_format": "b64_json",
