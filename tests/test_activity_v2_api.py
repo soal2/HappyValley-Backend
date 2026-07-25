@@ -1,5 +1,7 @@
 """Painting relay V2 behavior through public HTTP contracts."""
 
+import asyncio
+
 from httpx import AsyncClient
 
 from app.agents.base import ReflectionAnswerResult
@@ -10,6 +12,20 @@ from app.models.room import ActivityRoom
 from app.services.activity_service import _valid_reflection_question
 from app.services.speech_service import split_speech
 from tests.conftest import register_user
+
+
+async def _wait_for_painting_turn(
+    client: AsyncClient, room_id: str, headers: dict[str, str]
+) -> dict[str, object]:
+    """Poll snapshot until the background pre-roll task reaches PAINTING_TURN."""
+    for _ in range(100):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == "PAINTING_TURN":
+            return snapshot
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        f"pre-roll did not reach PAINTING_TURN, last stage={snapshot.get('stage')!r}"  # noqa: F821
+    )
 
 
 def test_speech_chunks_do_not_leave_a_punctuation_only_tail() -> None:
@@ -43,6 +59,13 @@ async def test_v2_room_persists_a_random_order_for_all_five_members(
             headers=headers,
         )
     ).json()
+    # 开场话术由后台任务异步产生,等到 AI_INTRO 消息落到 messages 再继续断言。
+    room_id = started.json()["room_id"]
+    for _ in range(100):
+        if any(m["stage"] == "AI_INTRO" for m in snapshot.get("messages", [])):
+            break
+        await asyncio.sleep(0.05)
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
     state = snapshot["stage_state"]
     member_ids = [member["id"] for member in state["members"]]
 
@@ -95,7 +118,7 @@ async def test_painting_order_runs_ai_turns_and_waits_for_the_human(
         json={"mood": "想画一点明亮的颜色"},
     )
     room_id = started.json()["room_id"]
-    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    snapshot = await _wait_for_painting_turn(client, room_id, headers)
     state = snapshot["stage_state"]
     human_index = state["speaking_order"].index(user_id)
 
@@ -139,7 +162,7 @@ async def test_four_reflection_rounds_reuse_order_and_allow_human_skip(
         json={"mood": "想听听不同的看法"},
     )
     room_id = started.json()["room_id"]
-    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    snapshot = await _wait_for_painting_turn(client, room_id, headers)
     state = snapshot["stage_state"]
     human_index = state["speaking_order"].index(user_id)
     painted = await client.post(
@@ -236,7 +259,7 @@ async def test_skip_reflection_with_ai_invalid_reference_does_not_crash(
         )
         assert started.status_code == 201, started.text
         room_id = started.json()["room_id"]
-        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        snapshot = await _wait_for_painting_turn(client, room_id, headers)
         state = snapshot["stage_state"]
         human_index = state["speaking_order"].index(user_id)
         painted = await client.post(

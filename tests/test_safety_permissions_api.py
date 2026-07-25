@@ -1,5 +1,6 @@
 """Crisis, ownership, sharing, and cleanup boundaries."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
@@ -17,8 +18,19 @@ async def _start(client: AsyncClient, username: str) -> tuple[str, dict[str, str
     return room_id, headers
 
 
+async def _wait_for_painting_turn(
+    client: AsyncClient, room_id: str, headers: dict[str, str]
+) -> dict[str, object]:
+    for _ in range(100):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == "PAINTING_TURN":
+            return snapshot
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"pre-roll did not reach PAINTING_TURN, last stage={snapshot.get('stage')!r}")
+
+
 async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) -> str:
-    initial = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    initial = await _wait_for_painting_turn(client, room_id, headers)
     painted = await client.post(
         f"/api/rooms/{room_id}/commands",
         headers=headers,
@@ -61,6 +73,7 @@ async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) 
 
 async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: AsyncClient) -> None:
     room_id, headers = await _start(client, "安全用户")
+    initial = await _wait_for_painting_turn(client, room_id, headers)
     crisis_text = "我现在想自杀然后结束生命"
     blocked = await client.post(
         f"/api/rooms/{room_id}/commands",
@@ -69,9 +82,7 @@ async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: Async
             "command_id": "crisis-1",
             "type": "submit_painting_turn",
             "payload": {
-                "turn_index": (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()[
-                    "stage_state"
-                ]["painting_turn_index"],
+                "turn_index": initial["stage_state"]["painting_turn_index"],
                 "text": crisis_text,
             },
         },
@@ -110,7 +121,7 @@ async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: Async
 
 async def test_crisis_wait_timeout_terminates_without_postcard(client: AsyncClient) -> None:
     room_id, headers = await _start(client, "危机等待")
-    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+    snapshot = await _wait_for_painting_turn(client, room_id, headers)
     await client.post(
         f"/api/rooms/{room_id}/commands",
         headers=headers,

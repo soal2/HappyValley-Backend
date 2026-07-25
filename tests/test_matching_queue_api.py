@@ -28,8 +28,16 @@ async def test_started_room_has_rule_legal_ai_team(client: AsyncClient) -> None:
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "started"
-    snapshot = await client.get(f"/api/rooms/{body['room_id']}", headers=headers)
-    team = snapshot.json()["stage_state"]["members"]
+    room_id = body["room_id"]
+    # 开场 + 前几个 AI 同伴发言已搬到后台任务,轮询 snapshot 直到 stage 推进到 PAINTING_TURN
+    snapshot_json: dict[str, object] = {}
+    for _ in range(100):
+        snapshot = await client.get(f"/api/rooms/{room_id}", headers=headers)
+        snapshot_json = snapshot.json()
+        if snapshot_json.get("stage") == "PAINTING_TURN":
+            break
+        await asyncio.sleep(0.05)
+    team = snapshot_json["stage_state"]["members"]
     human = next(member for member in team if member["type"] == "human")
     assert human["name"] == "匹配测试"
     assert human["mbti"] == "INFP"
@@ -41,8 +49,8 @@ async def test_started_room_has_rule_legal_ai_team(client: AsyncClient) -> None:
     assert roles.count("quiet-resonator") == 1
     assert len(set(ai_mbti)) == 4
     assert len({member["id"] for member in team}) == 5
-    assert snapshot.json()["stage"] == "PAINTING_TURN"
-    assert len(snapshot.json()["stage_state"]["speaking_order"]) == 5
+    assert snapshot_json["stage"] == "PAINTING_TURN"
+    assert len(snapshot_json["stage_state"]["speaking_order"]) == 5
 
 
 async def test_activity_uses_rule_order_when_remote_ranking_is_unavailable(

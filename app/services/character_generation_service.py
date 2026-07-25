@@ -96,6 +96,13 @@ _futures: dict[str, asyncio.Future[None]] = {}
 _registry_lock = asyncio.Lock()
 
 
+# Separate registry for the AI_INTRO + PAINTING_TURN pre-roll background task.
+# Not shared with Stage B's _tasks because the two have different lifecycles
+# (Stage B may finish before pre-roll, and either may be retried independently).
+_preroll_tasks: dict[str, asyncio.Task[None]] = {}
+_preroll_lock = asyncio.Lock()
+
+
 async def start_for_room(room_id: str) -> None:
     """Idempotently launch the Stage B background task for a room.
 
@@ -110,6 +117,50 @@ async def start_for_room(room_id: str) -> None:
             _futures[room_id] = asyncio.get_event_loop().create_future()
         task = asyncio.create_task(_generate_conceptual_personas(room_id))
         _tasks[room_id] = task
+
+
+async def start_ai_intro_and_preroll(room_id: str) -> None:
+    """Idempotently launch the AI_INTRO opening + PAINTING_TURN pre-roll background task.
+
+    Lets the HTTP request that creates the room return immediately after Stage A;
+    the opening message and the first few AI peer turns are then streamed to the
+    room's WebSocket via ``connection_manager.send_to_room`` as the task progresses.
+    """
+    async with _preroll_lock:
+        existing = _preroll_tasks.get(room_id)
+        if existing is not None and not existing.done():
+            return  # already running
+        task = asyncio.create_task(_run_ai_intro_and_preroll(room_id))
+        _preroll_tasks[room_id] = task
+
+
+async def _run_ai_intro_and_preroll(room_id: str) -> None:
+    """Background wrapper: load agent_runtime, invoke activity_service pre-roll, cleanup."""
+    # Lazy import to avoid a circular dependency: activity_service imports
+    # character_generation_service at module load.
+    from app.services import activity_service
+
+    try:
+        agent_runtime = Container.get().agent_runtime
+        logger.info("ai_intro_preroll_started", room_id=room_id)
+        await activity_service.run_ai_intro_and_preroll(room_id, agent_runtime)
+        logger.info("ai_intro_preroll_completed", room_id=room_id)
+    except Exception:
+        logger.exception("ai_intro_preroll_failed", room_id=room_id)
+        try:
+            await connection_manager.send_to_room(
+                room_id,
+                {
+                    "type": "error",
+                    "error": "pre_roll_failed",
+                    "recoverable": True,
+                },
+            )
+        except Exception:
+            logger.exception("ai_intro_preroll_error_emit_failed", room_id=room_id)
+    finally:
+        async with _preroll_lock:
+            _preroll_tasks.pop(room_id, None)
 
 
 async def wait_ready(room_id: str, timeout: float) -> bool:
@@ -137,12 +188,16 @@ async def cancel_all() -> None:
     async with _registry_lock:
         tasks = list(_tasks.values())
         futures = list(_futures.values())
+    async with _preroll_lock:
+        preroll_tasks = list(_preroll_tasks.values())
     for future in futures:
         if not future.done():
             future.cancel()
     for task in tasks:
         task.cancel()
-    for task in tasks:
+    for task in preroll_tasks:
+        task.cancel()
+    for task in tasks + preroll_tasks:
         try:
             await task
         except (asyncio.CancelledError, Exception):
@@ -150,6 +205,8 @@ async def cancel_all() -> None:
     async with _registry_lock:
         _tasks.clear()
         _futures.clear()
+    async with _preroll_lock:
+        _preroll_tasks.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +328,7 @@ def _member_slot(rc: RoomCharacter, voice_id: str) -> dict[str, Any]:
         "era": rc.era,
         "mbti": rc.mbti,
         "role": rc.role,
+        "one_line_concept": rc.one_line_concept,
         "appearance_id": rc.appearance_id,
         "voice_id": voice_id,
         "source": rc.source,

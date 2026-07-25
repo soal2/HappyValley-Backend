@@ -12,6 +12,7 @@ import yaml
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.agents.base import (
     AgentRuntime,
@@ -21,11 +22,13 @@ from app.agents.base import (
     TextGenerationResult,
 )
 from app.config import get_settings
+from app.database import async_session_factory
 from app.domain.room_lock import room_lock_manager
 from app.media.storage import MediaStorage
 from app.models.postcard import GeneratedImage, Postcard
 from app.models.room import ActivityRoom, RoomMessage
 from app.models.user import User
+from app.realtime import connection_manager
 from app.services import character_generation_service, matching_service, queue_service, room_service
 from app.services.cleanup_service import CleanupService
 from app.services.crisis_service import CrisisService
@@ -293,7 +296,13 @@ async def create_activity_room(
     speaking_order = [str(member["id"]) for member in state["members"]]
     SystemRandom().shuffle(speaking_order)
     state["speaking_order"] = speaking_order
-    room.stage_state = state
+    # Force SQLAlchemy to detect the JSON column mutation — ``state`` was
+    # passed by reference to create_room earlier, so reassigning the same
+    # identity would be a silent no-op and the commit below would persist a
+    # stage_state with empty members/speaking_order. ``flag_modified`` is the
+    # explicit, idiomatic fix.
+    room.stage_state = dict(state)
+    flag_modified(room, "stage_state")
     await db.flush()
 
     if crisis:
@@ -310,13 +319,47 @@ async def create_activity_room(
         await db.flush()
         await db.commit()
     else:
-        opening_ready = await _generate_opening(room, state, db, agent_runtime)
+        # Stage A 已完成,room 与 members 已落库。开场话术 + 前几个 AI 同伴发言
+        # 通过 start_ai_intro_and_preroll 后台任务流式推送(WS 事件 stage_changed /
+        # message_created),让用户几秒内进房,避免在 HTTP 响应里等满 4 次 LLM 调用。
+        await db.commit()
+        await character_generation_service.start_ai_intro_and_preroll(room.id)
+    return room
+
+
+async def run_ai_intro_and_preroll(
+    room_id: str, agent_runtime: AgentRuntime
+) -> None:
+    """Background task: produce AI_INTRO opening + advance PAINTING_TURN through AI
+    peers until the human's turn. Streams events to the room's WebSocket via
+    ``connection_manager.send_to_room``.
+
+    Called from ``character_generation_service.start_ai_intro_and_preroll`` so the
+    HTTP request returns immediately after Stage A.
+    """
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(ActivityRoom).where(ActivityRoom.id == room_id)
+        )
+        room = result.scalar_one_or_none()
+        if room is None:
+            logger.warning("ai_intro_preroll_room_missing", room_id=room_id)
+            return
+
+        state = dict(room.stage_state or {})
+        dynamic = get_settings().CHARACTER_GENERATION_MODE == "dynamic"
+
+        async def emit(event: dict[str, Any]) -> None:
+            await connection_manager.send_to_room(room_id, event)
+
         if dynamic:
             # Launch Stage B background persona generation (idempotent).
-            await character_generation_service.start_for_room(room.id)
+            await character_generation_service.start_for_room(room_id)
+
+        opening_ready = await _generate_opening(room, state, db, agent_runtime, emit)
         if opening_ready:
-            await _run_v2_painting_until_human(room, state, db, agent_runtime, None)
-    return room
+            await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
+        await db.commit()
 
 
 async def terminate_legacy_room_for_upgrade(

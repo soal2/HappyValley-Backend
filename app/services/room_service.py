@@ -102,6 +102,7 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
                 "era": rc.era,
                 "mbti": rc.mbti,
                 "role": rc.role,
+                "one_line_concept": rc.one_line_concept,
                 "appearance_id": rc.appearance_id,
                 "source": rc.source,
                 "persona_status": rc.status,

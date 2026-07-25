@@ -24,8 +24,17 @@ async def _start(
     )
     assert response.status_code == 201
     room_id = response.json()["room_id"]
-    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
-    assert snapshot["stage"] == "PAINTING_TURN"
+    # 开场 + 前几个 AI 同伴发言在后台任务里跑(见 start_ai_intro_and_preroll);
+    # 等它把房间推进到 PAINTING_TURN 轮到人类为止。
+    snapshot: dict[str, object] = {}
+    for _ in range(100):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == "PAINTING_TURN":
+            break
+        await asyncio.sleep(0.05)
+    assert snapshot.get("stage") == "PAINTING_TURN", (
+        f"pre-roll did not reach PAINTING_TURN, got stage={snapshot.get('stage')!r}"
+    )
     assert snapshot["stage_state"]["current_speaker_id"] == user_id
     return room_id, headers, snapshot
 
