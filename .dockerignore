@@ -1,0 +1,17 @@
+.venv
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.codegraph
+happyvalley_backend.egg-info
+__pycache__
+*.pyc
+*.pyo
+tests
+docs
+*.md
+.env
+.env.*
+node_modules
