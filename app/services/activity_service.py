@@ -465,17 +465,11 @@ async def _run_v2_painting_until_human(
     contributions = list(state.get("contributions", []))
     index = int(state.get("painting_turn_index", len(contributions)))
 
-    # Stage C: wait for background persona generation, apply fallback, enrich peers.
     persona_map: dict[str, dict[str, Any]] | None = None
-    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
-        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+    dynamic = get_settings().CHARACTER_GENERATION_MODE == "dynamic"
 
     while index < len(order):
         member = _member_for(state, order[index])
-        if persona_map is not None:
-            persona = persona_map.get(str(member["id"]))
-            if persona is not None:
-                member = character_generation_service.enrich_peer_with_persona(member, persona)
         room.current_stage = "PAINTING_TURN"
         state.update(
             painting_turn_index=index,
@@ -487,6 +481,14 @@ async def _run_v2_painting_until_human(
         await _commit_state(room, state, db, emit, "stage_changed")
         if member["type"] == "human":
             return False
+        # Publish the pending AI turn before Stage C waits for background persona
+        # generation, so snapshot recovery can observe forward progress.
+        if dynamic and persona_map is None:
+            persona_map = await character_generation_service.ensure_personas_ready(room.id)
+        if persona_map is not None:
+            persona = persona_map.get(str(member["id"]))
+            if persona is not None:
+                member = character_generation_service.enrich_peer_with_persona(member, persona)
         previous = [str(item["text"]) for item in contributions]
         try:
             attempts = 0

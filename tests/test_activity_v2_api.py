@@ -9,6 +9,7 @@ from app.agents.fake_runtime import FakeAgentRuntime
 from app.container import Container
 from app.database import async_session_factory
 from app.models.room import ActivityRoom
+from app.services import activity_service, character_generation_service
 from app.services.activity_service import _valid_reflection_question
 from app.services.speech_service import split_speech
 from tests.conftest import register_user
@@ -126,6 +127,48 @@ async def test_v2_room_persists_a_random_order_for_all_five_members(
     assert opening["speech"]["voice_id"] == "facilitator"
     assert opening["speech"]["limit_ms"] == 20_000
     assert "".join(chunk["text"] for chunk in opening["speech"]["chunks"]) == opening["text"]
+
+
+async def test_first_ai_turn_is_published_before_persona_preparation_finishes(
+    client: AsyncClient, monkeypatch
+) -> None:
+    user_id, headers = await register_user(client, "首位 AI 状态用户")
+    persona_waiting = asyncio.Event()
+    release_personas = asyncio.Event()
+
+    def put_human_last(_random, member_ids: list[str]) -> None:
+        member_ids.sort(key=lambda member_id: member_id == user_id)
+
+    async def wait_for_personas(_room_id: str) -> dict[str, dict[str, object]]:
+        persona_waiting.set()
+        await release_personas.wait()
+        return {}
+
+    monkeypatch.setattr(activity_service.SystemRandom, "shuffle", put_human_last)
+    monkeypatch.setattr(
+        character_generation_service, "ensure_personas_ready", wait_for_personas
+    )
+
+    started = await client.post(
+        "/api/activities",
+        headers=headers,
+        json={"mood": "想听第一位 AI 团友慢慢分享"},
+    )
+    assert started.status_code == 201, started.text
+    await asyncio.wait_for(persona_waiting.wait(), timeout=1)
+    room_id = started.json()["room_id"]
+    snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+
+    try:
+        assert snapshot["stage"] == "PAINTING_TURN"
+        assert snapshot["stage_state"]["generation_status"] == "processing"
+        assert snapshot["stage_state"]["current_speaker_id"] != user_id
+        assert snapshot["stage_state"]["current_speaker_id"] == snapshot["stage_state"][
+            "speaking_order"
+        ][0]
+    finally:
+        release_personas.set()
+        await _wait_for_painting_turn(client, room_id, headers)
 
 
 async def test_active_v1_room_is_safely_terminated_for_flow_upgrade(
