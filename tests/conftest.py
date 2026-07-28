@@ -18,6 +18,7 @@ os.environ["MEDIA_STORAGE_PATH"] = str(Path(__file__).parent / "media")
 from app.container import Container  # noqa: E402
 from app.database import Base, engine  # noqa: E402
 from app.main import app  # noqa: E402
+from app.services import activity_continuation_service  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +29,7 @@ async def clean_database() -> AsyncIterator[None]:
         await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
     yield
+    await activity_continuation_service.cancel_all()
 
 
 @pytest.fixture

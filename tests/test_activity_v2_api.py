@@ -21,11 +21,58 @@ async def _wait_for_painting_turn(
     for _ in range(100):
         snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
         if snapshot.get("stage") == "PAINTING_TURN":
-            return snapshot
+            current_id = snapshot["stage_state"].get("current_speaker_id")
+            current = next(
+                (
+                    member
+                    for member in snapshot["stage_state"].get("members", [])
+                    if member["id"] == current_id
+                ),
+                None,
+            )
+            if current and current["type"] == "human":
+                return snapshot
         await asyncio.sleep(0.05)
     raise AssertionError(
         f"pre-roll did not reach PAINTING_TURN, last stage={snapshot.get('stage')!r}"  # noqa: F821
     )
+
+
+async def _wait_for_human_or_completed(
+    client: AsyncClient, room_id: str, headers: dict[str, str], round_index: int
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for _ in range(200):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == "COMPLETED":
+            return snapshot
+        state = snapshot.get("stage_state", {})
+        current_id = state.get("current_speaker_id")
+        current = next(
+            (member for member in state.get("members", []) if member["id"] == current_id),
+            None,
+        )
+        if (
+            snapshot.get("stage") == "REFLECTION_TURN"
+            and state.get("reflection_round_index") == round_index
+            and current
+            and current["type"] == "human"
+        ):
+            return snapshot
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"reflection did not advance: {snapshot}")
+
+
+async def _wait_for_stage(
+    client: AsyncClient, room_id: str, headers: dict[str, str], stage: str
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for _ in range(200):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == stage:
+            return snapshot
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"room did not reach {stage}: {snapshot}")
 
 
 def test_speech_chunks_do_not_leave_a_punctuation_only_tail() -> None:
@@ -141,7 +188,8 @@ async def test_painting_order_runs_ai_turns_and_waits_for_the_human(
     )
 
     assert submitted.status_code == 200, submitted.text
-    completed = submitted.json()["snapshot"]
+    assert submitted.json()["snapshot"]["stage_state"]["generation_status"] == "processing"
+    completed = await _wait_for_stage(client, room_id, headers, "ARTWORK_REVEAL")
     assert completed["stage"] == "ARTWORK_REVEAL"
     assert len(completed["stage_state"]["contributions"]) == 5
     assert [item["member_id"] for item in completed["stage_state"]["contributions"]] == state[
@@ -174,7 +222,8 @@ async def test_four_reflection_rounds_reuse_order_and_allow_human_skip(
             "payload": {"turn_index": human_index, "text": "湖边围着五棵安静的小树"},
         },
     )
-    assert painted.json()["snapshot"]["stage"] == "ARTWORK_REVEAL"
+    assert painted.status_code == 200, painted.text
+    painted_snapshot = await _wait_for_stage(client, room_id, headers, "ARTWORK_REVEAL")
 
     revealed = await client.post(
         f"/api/rooms/{room_id}/commands",
@@ -182,11 +231,11 @@ async def test_four_reflection_rounds_reuse_order_and_allow_human_skip(
         json={
             "command_id": "reveal-complete",
             "type": "complete_artwork_reveal",
-            "payload": {"expected_revision": painted.json()["snapshot"]["revision"]},
+            "payload": {"expected_revision": painted_snapshot["revision"]},
         },
     )
     assert revealed.status_code == 200, revealed.text
-    current = revealed.json()["snapshot"]
+    current = await _wait_for_human_or_completed(client, room_id, headers, 0)
 
     for round_index in range(4):
         assert current["stage"] == "REFLECTION_TURN"
@@ -207,7 +256,7 @@ async def test_four_reflection_rounds_reuse_order_and_allow_human_skip(
             },
         )
         assert response.status_code == 200, response.text
-        current = response.json()["snapshot"]
+        current = await _wait_for_human_or_completed(client, room_id, headers, round_index + 1)
 
     assert current["stage"] == "COMPLETED"
     assert runtime.calls["reflection_question"] - before.get("reflection_question", 0) == 4
@@ -271,7 +320,8 @@ async def test_skip_reflection_with_ai_invalid_reference_does_not_crash(
                 "payload": {"turn_index": human_index, "text": "湖边围着五棵安静的小树"},
             },
         )
-        assert painted.json()["snapshot"]["stage"] == "ARTWORK_REVEAL"
+        assert painted.status_code == 200, painted.text
+        painted_snapshot = await _wait_for_stage(client, room_id, headers, "ARTWORK_REVEAL")
 
         revealed = await client.post(
             f"/api/rooms/{room_id}/commands",
@@ -279,11 +329,11 @@ async def test_skip_reflection_with_ai_invalid_reference_does_not_crash(
             json={
                 "command_id": "reveal-complete",
                 "type": "complete_artwork_reveal",
-                "payload": {"expected_revision": painted.json()["snapshot"]["revision"]},
+                "payload": {"expected_revision": painted_snapshot["revision"]},
             },
         )
         assert revealed.status_code == 200, revealed.text
-        current = revealed.json()["snapshot"]
+        current = await _wait_for_human_or_completed(client, room_id, headers, 0)
 
         for round_index in range(4):
             assert current["stage"] == "REFLECTION_TURN"
@@ -304,7 +354,7 @@ async def test_skip_reflection_with_ai_invalid_reference_does_not_crash(
                 },
             )
             assert response.status_code == 200, response.text
-            current = response.json()["snapshot"]
+            current = await _wait_for_human_or_completed(client, room_id, headers, round_index + 1)
 
         assert current["stage"] == "COMPLETED"
     finally:

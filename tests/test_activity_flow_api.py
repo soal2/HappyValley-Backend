@@ -11,7 +11,8 @@ from app.agents.fake_runtime import FakeAgentRuntime
 from app.container import Container
 from app.database import async_session_factory
 from app.models.postcard import GeneratedImage
-from app.services.activity_service import execute_command
+from app.services import activity_continuation_service
+from app.services.activity_service import execute_command, resume_interrupted_activity
 from tests.conftest import register_user
 
 
@@ -29,12 +30,15 @@ async def _start(
     snapshot: dict[str, object] = {}
     for _ in range(100):
         snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
-        if snapshot.get("stage") == "PAINTING_TURN":
+        if (
+            snapshot.get("stage") == "PAINTING_TURN"
+            and snapshot.get("stage_state", {}).get("current_speaker_id") == user_id
+        ):
             break
         await asyncio.sleep(0.05)
-    assert snapshot.get("stage") == "PAINTING_TURN", (
-        f"pre-roll did not reach PAINTING_TURN, got stage={snapshot.get('stage')!r}"
-    )
+    assert (
+        snapshot.get("stage") == "PAINTING_TURN"
+    ), f"pre-roll did not reach PAINTING_TURN, got stage={snapshot.get('stage')!r}"
     assert snapshot["stage_state"]["current_speaker_id"] == user_id
     return room_id, headers, snapshot
 
@@ -61,6 +65,21 @@ async def _submit_painting(
     )
 
 
+async def _wait_for_snapshot(
+    client: AsyncClient,
+    room_id: str,
+    headers: dict[str, str],
+    predicate,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for _ in range(200):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if predicate(snapshot):
+            return snapshot
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"room did not reach expected state: {snapshot}")
+
+
 async def _complete_reflections(
     client: AsyncClient,
     room_id: str,
@@ -77,7 +96,16 @@ async def _complete_reflections(
         },
     )
     assert revealed.status_code == 200, revealed.text
-    current = revealed.json()["snapshot"]
+    current = await _wait_for_snapshot(
+        client,
+        room_id,
+        headers,
+        lambda item: item["stage"] == "REFLECTION_TURN"
+        and item["stage_state"].get("current_speaker_id")
+        == next(
+            member["id"] for member in item["stage_state"]["members"] if member["type"] == "human"
+        ),
+    )
     for round_index in range(4):
         assert current["stage"] == "REFLECTION_TURN"
         response = await client.post(
@@ -93,7 +121,22 @@ async def _complete_reflections(
             },
         )
         assert response.status_code == 200, response.text
-        current = response.json()["snapshot"]
+        current = await _wait_for_snapshot(
+            client,
+            room_id,
+            headers,
+            lambda item, expected=round_index + 1: item["stage"] == "COMPLETED"
+            or (
+                item["stage"] == "REFLECTION_TURN"
+                and item["stage_state"].get("reflection_round_index") == expected
+                and item["stage_state"].get("current_speaker_id")
+                == next(
+                    member["id"]
+                    for member in item["stage_state"]["members"]
+                    if member["type"] == "human"
+                )
+            ),
+        )
     return current
 
 
@@ -128,7 +171,10 @@ async def test_fake_ai_completes_v2_with_27_text_calls_and_restorable_context(
         text="一棵长在山谷中央的小树",
     )
     assert relay.status_code == 200, relay.text
-    reveal_snapshot = relay.json()["snapshot"]
+    assert relay.json()["snapshot"]["stage_state"]["generation_status"] == "processing"
+    reveal_snapshot = await _wait_for_snapshot(
+        client, room_id, headers, lambda item: item["stage"] == "ARTWORK_REVEAL"
+    )
     assert reveal_snapshot["stage"] == "ARTWORK_REVEAL"
     assert reveal_snapshot["stage_state"]["image_status"] == "completed"
 
@@ -183,6 +229,99 @@ class FailingImageGenerator(ImageGenerator):
         return ImageResult(status="failed", error="simulated outage")
 
 
+class BlockingImageGenerator(ImageGenerator):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def generate(self, prompt: str) -> ImageResult:
+        self.started.set()
+        await self.release.wait()
+        return ImageResult(status="failed", error="released test generator")
+
+
+async def test_v2_command_confirms_while_background_generation_is_blocked(
+    client: AsyncClient,
+) -> None:
+    room_id, headers, initial = await _start(client, "快速确认")
+    container = Container.get()
+    original = container.image_generator
+    blocker = BlockingImageGenerator()
+    container.image_generator = blocker
+    request_task = asyncio.create_task(
+        _submit_painting(
+            client,
+            room_id,
+            headers,
+            initial,
+            command_id="painting-fast-ack",
+            text="云层后面的一束光",
+        )
+    )
+    try:
+        await asyncio.wait_for(blocker.started.wait(), timeout=2)
+        response = await asyncio.wait_for(asyncio.shield(request_task), timeout=0.2)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == "accepted"
+        assert body["snapshot"]["stage_state"]["generation_status"] == "processing"
+        heartbeat = await asyncio.wait_for(
+            client.post(
+                f"/api/rooms/{room_id}/commands",
+                headers=headers,
+                json={"command_id": "heartbeat-fast", "type": "heartbeat", "payload": {}},
+            ),
+            timeout=0.2,
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        exited = await asyncio.wait_for(
+            client.post(
+                f"/api/rooms/{room_id}/commands",
+                headers=headers,
+                json={"command_id": "exit-fast", "type": "exit", "payload": {}},
+            ),
+            timeout=0.5,
+        )
+        assert exited.json()["snapshot"]["stage"] == "TERMINATED"
+    finally:
+        blocker.release.set()
+        await request_task
+        container.image_generator = original
+
+
+async def test_polling_restores_a_processing_command_after_its_task_is_lost(
+    client: AsyncClient,
+) -> None:
+    room_id, headers, initial = await _start(client, "续跑恢复")
+    container = Container.get()
+    original = container.image_generator
+    blocker = BlockingImageGenerator()
+    container.image_generator = blocker
+    try:
+        response = await _submit_painting(
+            client,
+            room_id,
+            headers,
+            initial,
+            command_id="painting-resume",
+            text="雨后重新亮起的窗",
+        )
+        assert response.status_code == 200, response.text
+        await asyncio.wait_for(blocker.started.wait(), timeout=2)
+        await activity_continuation_service.cancel(room_id)
+        container.image_generator = original
+
+        resumed = await client.get(f"/api/rooms/{room_id}", headers=headers)
+        assert resumed.status_code == 200, resumed.text
+        completed = await _wait_for_snapshot(
+            client, room_id, headers, lambda item: item["stage"] == "ARTWORK_REVEAL"
+        )
+        assert len(completed["stage_state"]["contributions"]) == 5
+    finally:
+        blocker.release.set()
+        container.image_generator = original
+
+
 async def test_image_failure_stays_in_generation_until_real_retry(client: AsyncClient) -> None:
     room_id, headers, initial = await _start(client, "图片失败")
     container = Container.get()
@@ -197,7 +336,13 @@ async def test_image_failure_stays_in_generation_until_real_retry(client: AsyncC
             command_id="painting-fail",
             text="夜空下的一盏灯",
         )
-        snapshot = failed.json()["snapshot"]
+        assert failed.status_code == 200, failed.text
+        snapshot = await _wait_for_snapshot(
+            client,
+            room_id,
+            headers,
+            lambda item: item["stage_state"].get("image_status") == "failed",
+        )
         assert snapshot["stage"] == "IMAGE_GENERATION"
         assert snapshot["stage_state"]["image_status"] == "failed"
         assert "postcard_id" not in snapshot["stage_state"]
@@ -210,8 +355,10 @@ async def test_image_failure_stays_in_generation_until_real_retry(client: AsyncC
         json={"command_id": "retry-image", "type": "retry_image", "payload": {}},
     )
     assert retried.status_code == 200, retried.text
-    assert retried.json()["snapshot"]["stage"] == "ARTWORK_REVEAL"
-    assert retried.json()["snapshot"]["stage_state"]["image_status"] == "completed"
+    retry_snapshot = await _wait_for_snapshot(
+        client, room_id, headers, lambda item: item["stage"] == "ARTWORK_REVEAL"
+    )
+    assert retry_snapshot["stage_state"]["image_status"] == "completed"
 
 
 async def test_concurrent_duplicate_command_generates_once(client: AsyncClient) -> None:
@@ -238,8 +385,9 @@ async def test_concurrent_duplicate_command_generates_once(client: AsyncClient) 
         "accepted",
         "already_processed",
     }
-    snapshot = results[0]["snapshot"]
-    assert isinstance(snapshot, dict)
+    snapshot = await _wait_for_snapshot(
+        client, room_id, headers, lambda item: item["stage"] == "ARTWORK_REVEAL"
+    )
     assert len(snapshot["stage_state"]["contributions"]) == 5
 
 
@@ -269,7 +417,17 @@ async def test_event_delivery_failure_does_not_abort_room_orchestration(
             container.media_storage,
             disconnected_emitter,
         )
-    assert result == "accepted"
+    assert result.status == "accepted"
+    async with async_session_factory() as session:
+        await resume_interrupted_activity(
+            room_id,
+            user_id,
+            session,
+            container.agent_runtime,
+            container.image_generator,
+            container.media_storage,
+            disconnected_emitter,
+        )
     snapshot = await client.get(f"/api/rooms/{room_id}", headers=headers)
     assert snapshot.json()["stage"] == "ARTWORK_REVEAL"
     assert len(snapshot.json()["stage_state"]["contributions"]) == 5
@@ -284,6 +442,9 @@ async def test_active_exit_removes_temporary_generated_media(client: AsyncClient
         initial,
         command_id="painting-exit",
         text="草地上的风筝",
+    )
+    await _wait_for_snapshot(
+        client, room_id, headers, lambda item: item["stage"] == "ARTWORK_REVEAL"
     )
     media_files = list((Path(__file__).parent / "media").rglob("*.png"))
     assert len(media_files) == 1

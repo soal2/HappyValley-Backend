@@ -24,9 +24,58 @@ async def _wait_for_painting_turn(
     for _ in range(100):
         snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
         if snapshot.get("stage") == "PAINTING_TURN":
-            return snapshot
+            state = snapshot["stage_state"]
+            current_id = state.get("current_speaker_id")
+            current = next(
+                (member for member in state.get("members", []) if member["id"] == current_id),
+                None,
+            )
+            if current and current["type"] == "human":
+                return snapshot
         await asyncio.sleep(0.05)
-    raise AssertionError(f"pre-roll did not reach PAINTING_TURN, last stage={snapshot.get('stage')!r}")
+    raise AssertionError(
+        f"pre-roll did not reach PAINTING_TURN, last stage={snapshot.get('stage')!r}"
+    )
+
+
+async def _wait_for_stage(
+    client: AsyncClient, room_id: str, headers: dict[str, str], stage: str
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for _ in range(200):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == stage:
+            return snapshot
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"room did not reach {stage}: {snapshot}")
+
+
+async def _wait_for_reflection_or_completed(
+    client: AsyncClient,
+    room_id: str,
+    headers: dict[str, str],
+    round_index: int,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {}
+    for _ in range(200):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == "COMPLETED":
+            return snapshot
+        state = snapshot.get("stage_state", {})
+        current_id = state.get("current_speaker_id")
+        current = next(
+            (member for member in state.get("members", []) if member["id"] == current_id),
+            None,
+        )
+        if (
+            snapshot.get("stage") == "REFLECTION_TURN"
+            and state.get("reflection_round_index") == round_index
+            and current
+            and current["type"] == "human"
+        ):
+            return snapshot
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"reflection did not advance: {snapshot}")
 
 
 async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) -> str:
@@ -43,7 +92,8 @@ async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) 
             },
         },
     )
-    current = painted.json()["snapshot"]
+    assert painted.status_code == 200, painted.text
+    current = await _wait_for_stage(client, room_id, headers, "ARTWORK_REVEAL")
     revealed = await client.post(
         f"/api/rooms/{room_id}/commands",
         headers=headers,
@@ -53,7 +103,8 @@ async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) 
             "payload": {"expected_revision": current["revision"]},
         },
     )
-    current = revealed.json()["snapshot"]
+    assert revealed.status_code == 200, revealed.text
+    current = await _wait_for_reflection_or_completed(client, room_id, headers, 0)
     for round_index in range(4):
         answered = await client.post(
             f"/api/rooms/{room_id}/commands",
@@ -67,7 +118,8 @@ async def _complete(client: AsyncClient, room_id: str, headers: dict[str, str]) 
                 },
             },
         )
-        current = answered.json()["snapshot"]
+        assert answered.status_code == 200, answered.text
+        current = await _wait_for_reflection_or_completed(client, room_id, headers, round_index + 1)
     return current["stage_state"]["postcard_id"]
 
 
@@ -116,7 +168,10 @@ async def test_crisis_text_is_blocked_not_persisted_and_can_resume(client: Async
             },
         },
     )
-    assert safe.json()["snapshot"]["stage"] == "ARTWORK_REVEAL"
+    assert safe.status_code == 200, safe.text
+    assert (await _wait_for_stage(client, room_id, headers, "ARTWORK_REVEAL"))["stage"] == (
+        "ARTWORK_REVEAL"
+    )
 
 
 async def test_crisis_wait_timeout_terminates_without_postcard(client: AsyncClient) -> None:

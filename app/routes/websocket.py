@@ -1,7 +1,9 @@
 """JWT-authenticated native WebSocket activity protocol."""
 
 from datetime import UTC, datetime
+from time import monotonic
 
+import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -11,9 +13,16 @@ from app.database import async_session_factory
 from app.models.room import ActivityRoom
 from app.realtime import connection_manager
 from app.schemas.activity import RoomCommandRequest
-from app.services import activity_service, auth_service, queue_service, room_service
+from app.services import (
+    activity_continuation_service,
+    activity_service,
+    auth_service,
+    queue_service,
+    room_service,
+)
 
 router = APIRouter()
+logger = structlog.get_logger()
 
 
 @router.websocket("/api/rooms/{room_id}/ws")
@@ -67,18 +76,15 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
 
     try:
         async with async_session_factory() as db:
-            container = Container.get()
-            await activity_service.resume_interrupted_activity(
-                room_id,
-                user_id,
-                db,
-                container.agent_runtime,
-                container.image_generator,
-                container.media_storage,
-            )
             snapshot = await room_service.get_room_snapshot(room_id, user_id, db)
-            if not await connection_manager.send_to_room(room_id, {"type": "snapshot", "data": snapshot}):
+            if not await connection_manager.send_to_room(
+                room_id, {"type": "snapshot", "data": snapshot}
+            ):
                 return
+            if activity_continuation_service.needs_continuation(
+                snapshot["status"], snapshot["stage"], snapshot["stage_state"]
+            ):
+                await activity_continuation_service.start(room_id)
         while True:
             raw = await websocket.receive_json()
             try:
@@ -96,10 +102,10 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                 return
             async with async_session_factory() as db:
                 container = Container.get()
+                started_at = monotonic()
                 try:
-
-                    async def emit(event: dict[str, object]) -> None:
-                        await connection_manager.send_to_room(room_id, event)
+                    if command.type == "exit":
+                        await activity_continuation_service.cancel(room_id)
 
                     result = await activity_service.execute_command(
                         room_id,
@@ -111,7 +117,7 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                         container.agent_runtime,
                         container.image_generator,
                         container.media_storage,
-                        emit,
+                        None,
                     )
                     await db.commit()
                     snapshot = await room_service.get_room_snapshot(room_id, user_id, db)
@@ -120,11 +126,24 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                         {
                             "type": "command_result",
                             "command_id": command.command_id,
-                            "status": result,
+                            "status": result.status,
                             "data": snapshot,
                         },
                     ):
                         return
+                    if result.continuation_required:
+                        await activity_continuation_service.start(room_id, command.command_id)
+                    logger.info(
+                        "activity.command_confirmed",
+                        transport="websocket",
+                        room_id=room_id,
+                        command_id=command.command_id,
+                        command_type=command.type,
+                        revision=snapshot["revision"],
+                        stage=snapshot["stage"],
+                        duration_ms=round((monotonic() - started_at) * 1000),
+                        continuation_required=result.continuation_required,
+                    )
                 except Exception as error:
                     await db.rollback()
                     if not await connection_manager.send_to_room(
