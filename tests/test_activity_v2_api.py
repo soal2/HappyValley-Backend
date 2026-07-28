@@ -3,13 +3,15 @@
 import asyncio
 
 from httpx import AsyncClient
+from sqlalchemy import func, select, update
 
 from app.agents.base import ReflectionAnswerResult
 from app.agents.fake_runtime import FakeAgentRuntime
 from app.container import Container
 from app.database import async_session_factory
 from app.models.room import ActivityRoom
-from app.services import activity_service, character_generation_service
+from app.models.room_character import RoomCharacter
+from app.services import activity_service, character_generation_service, room_service
 from app.services.activity_service import _valid_reflection_question
 from app.services.speech_service import split_speech
 from tests.conftest import register_user
@@ -74,6 +76,174 @@ async def _wait_for_stage(
             return snapshot
         await asyncio.sleep(0.02)
     raise AssertionError(f"room did not reach {stage}: {snapshot}")
+
+
+async def test_room_snapshot_refreshes_member_display_fields_after_background_commit(
+    client: AsyncClient,
+) -> None:
+    user_id, _ = await register_user(client, "成员校准用户")
+    async with async_session_factory() as stale_session:
+        room = ActivityRoom(
+            user_id=user_id,
+            status="active",
+            current_stage="PAINTING_TURN",
+            stage_state={
+                "activity_version": "2.0",
+                "members": [
+                    {
+                        "id": "peer-1",
+                        "type": "ai_peer",
+                        "name": "骨架伙伴",
+                        "era": "当代",
+                        "mbti": "INTJ",
+                        "role": "been-there",
+                        "one_line_concept": "初始设定",
+                        "appearance_id": "xqg-intj-architect",
+                        "source": "conceptual",
+                        "persona_status": "skeleton",
+                    }
+                ],
+            },
+        )
+        stale_session.add(room)
+        await stale_session.flush()
+        stale_session.add(
+            RoomCharacter(
+                id="peer-1",
+                room_id=room.id,
+                slot=0,
+                role="been-there",
+                source="conceptual",
+                name="骨架伙伴",
+                era="当代",
+                mbti="INTJ",
+                appearance_id="xqg-intj-architect",
+                one_line_concept="初始设定",
+                status="skeleton",
+            )
+        )
+        await stale_session.commit()
+
+        cached_character = await stale_session.get(RoomCharacter, "peer-1")
+        assert cached_character is not None
+        initial = await room_service.get_room_snapshot(room.id, user_id, stale_session)
+        assert initial["stage_state"]["members"][0]["name"] == "骨架伙伴"
+
+        async with async_session_factory() as background_session:
+            await background_session.execute(
+                update(RoomCharacter)
+                .where(RoomCharacter.id == "peer-1")
+                .values(
+                    name="最终伙伴",
+                    mbti="ENFP",
+                    appearance_id="xqg-enfp-campaigner",
+                    source="fallback",
+                    status="ready",
+                    one_line_concept="最终设定",
+                )
+            )
+            await background_session.commit()
+
+        refreshed = await room_service.get_room_snapshot(room.id, user_id, stale_session)
+        member = refreshed["stage_state"]["members"][0]
+        assert member["name"] == "最终伙伴"
+        assert member["mbti"] == "ENFP"
+        assert member["appearance_id"] == "xqg-enfp-campaigner"
+        assert member["source"] == "fallback"
+        assert member["persona_status"] == "ready"
+        assert member["one_line_concept"] == "最终设定"
+
+
+async def test_stage_b_team_update_carries_the_committed_room_snapshot(
+    client: AsyncClient, monkeypatch
+) -> None:
+    events: list[dict[str, object]] = []
+
+    async def capture_event(_room_id: str, payload: dict[str, object]) -> bool:
+        events.append(payload)
+        return True
+
+    monkeypatch.setattr(
+        character_generation_service.connection_manager,
+        "send_to_room",
+        capture_event,
+    )
+    _, headers = await register_user(client, "成员推送用户")
+    started = await client.post(
+        "/api/activities",
+        headers=headers,
+        json={"mood": "等待最终成员资料"},
+    )
+    assert started.status_code == 201, started.text
+
+    for _ in range(100):
+        team_event = next(
+            (event for event in events if event.get("type") == "team_updated"),
+            None,
+        )
+        if team_event is not None:
+            break
+        await asyncio.sleep(0.02)
+
+    assert team_event is not None
+    assert team_event["data"]["room_id"] == started.json()["room_id"]
+    members = team_event["data"]["stage_state"]["members"]
+    assert len(members) == 5
+    assert all(
+        member.get("persona_status") == "ready"
+        for member in members
+        if member["type"] == "ai_peer"
+    )
+    assert all("system_prompt_template" not in member for member in members)
+
+
+async def test_stage_b_fallback_publishes_the_calibrated_team_snapshot(
+    client: AsyncClient, monkeypatch
+) -> None:
+    events: list[dict[str, object]] = []
+
+    async def capture_event(_room_id: str, payload: dict[str, object]) -> bool:
+        events.append(payload)
+        return True
+
+    async def fail_persona(*_args, **_kwargs):
+        raise TimeoutError("persona timeout")
+
+    monkeypatch.setattr(
+        character_generation_service.connection_manager,
+        "send_to_room",
+        capture_event,
+    )
+    monkeypatch.setattr(
+        Container.get().agent_runtime,
+        "generate_conceptual_persona",
+        fail_persona,
+    )
+    _, headers = await register_user(client, "成员降级推送用户")
+    started = await client.post(
+        "/api/activities",
+        headers=headers,
+        json={"mood": "即使超时也要看到正确伙伴"},
+    )
+    assert started.status_code == 201, started.text
+
+    for _ in range(100):
+        team_event = next(
+            (event for event in events if event.get("type") == "team_updated"),
+            None,
+        )
+        if team_event is not None:
+            break
+        await asyncio.sleep(0.02)
+
+    assert team_event is not None
+    peers = [
+        member
+        for member in team_event["data"]["stage_state"]["members"]
+        if member["type"] == "ai_peer"
+    ]
+    assert all(member.get("persona_status") == "ready" for member in peers)
+    assert any(member.get("source") == "fallback" for member in peers)
 
 
 def test_speech_chunks_do_not_leave_a_punctuation_only_tail() -> None:
@@ -304,6 +474,28 @@ async def test_four_reflection_rounds_reuse_order_and_allow_human_skip(
     assert current["stage"] == "COMPLETED"
     assert runtime.calls["reflection_question"] - before.get("reflection_question", 0) == 4
     assert runtime.calls["reflection_answer"] - before.get("reflection_answer", 0) == 16
+    for _ in range(100):
+        async with async_session_factory() as session:
+            remaining_characters = await session.scalar(
+                select(func.count())
+                .select_from(RoomCharacter)
+                .where(RoomCharacter.room_id == room_id)
+            )
+        if remaining_characters == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert remaining_characters == 0
+    completed_snapshot = (
+        await client.get(f"/api/rooms/{room_id}", headers=headers)
+    ).json()
+    expected_members = {member["id"]: member for member in state["members"]}
+    for member in completed_snapshot["stage_state"]["members"]:
+        expected = expected_members[member["id"]]
+        assert member["name"] == expected["name"]
+        assert member.get("mbti") == expected.get("mbti")
+        assert member.get("appearance_id") == expected.get("appearance_id")
+        if member["type"] == "ai_peer":
+            assert member.get("persona_status") == "ready"
     postcard = await client.get(
         f"/api/postcards/{current['stage_state']['postcard_id']}", headers=headers
     )

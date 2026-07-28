@@ -797,6 +797,16 @@ async def _complete_v2_activity(
             room, state, db, emit, "error", error="generation_failed", recoverable=True
         )
         return
+    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
+        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+        state["members"] = [
+            (
+                _merge_display_fields(member, persona_map.get(str(member.get("id"))))
+                if member.get("type") == "ai_peer"
+                else member
+            )
+            for member in state.get("members", [])
+        ]
     members_by_id = {str(member["id"]): dict(member) for member in state.get("members", [])}
     ordered_members = [
         members_by_id[member_id]
@@ -1288,6 +1298,7 @@ async def _run_completion(
             )
             for member in postcard_members
         ]
+        state["members"] = postcard_members
     postcard = Postcard(
         user_id=room.user_id,
         room_id=room.id,

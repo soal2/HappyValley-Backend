@@ -82,11 +82,13 @@ async def get_room_snapshot(room_id: str, user_id: str, db: AsyncSession) -> dic
     public_state = _public_stage_state(room)
 
     # Dynamic mode: merge latest display fields from room_characters so the
-    # snapshot reflects fallback name/era/mbti changes. After cleanup (rows
-    # deleted) the skeleton values from stage_state are retained.
+    # snapshot reflects fallback name/era/mbti changes. After cleanup, the final
+    # display fields retained in stage_state remain available.
     if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
         char_result = await db.execute(
-            select(RoomCharacter).where(RoomCharacter.room_id == room_id)
+            select(RoomCharacter)
+            .where(RoomCharacter.room_id == room_id)
+            .execution_options(populate_existing=True)
         )
         char_by_id = {rc.id: rc for rc in char_result.scalars()}
         members = list(public_state.get("members") or [])
