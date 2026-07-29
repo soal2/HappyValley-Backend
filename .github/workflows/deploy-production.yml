@@ -1,0 +1,66 @@
+name: Deploy Backend Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy (defaults to master)
+        required: false
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: happyvalley-production-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.7.13"
+
+      - name: Validate backend
+        run: |
+          uv sync --frozen --no-dev
+          uv run python -c "from app.main import app; assert app is not None"
+
+      - name: Build immutable image
+        id: image
+        run: |
+          COMMIT="$(git rev-parse HEAD)"
+          IMAGE="happyvalley-backend:${COMMIT}"
+          docker build --label "happyvalley.commit=${COMMIT}" --tag "$IMAGE" .
+          docker save "$IMAGE" | gzip -1 > "$RUNNER_TEMP/backend-${COMMIT}.tar.gz"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "archive=$RUNNER_TEMP/backend-${COMMIT}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Configure deployment SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Upload and release backend
+        env:
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          COMMIT: ${{ steps.image.outputs.commit }}
+          ARCHIVE: ${{ steps.image.outputs.archive }}
+        run: |
+          TARGET="$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST"
+          cat "$ARCHIVE" | ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes "$TARGET" "receive-image backend $COMMIT"
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes "$TARGET" "release-image backend $COMMIT"
