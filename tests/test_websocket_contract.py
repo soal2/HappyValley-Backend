@@ -1,5 +1,7 @@
 """Native WebSocket authentication, snapshot, command, and reconnect contract."""
 
+import asyncio
+
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 from starlette.websockets import WebSocketDisconnect
@@ -15,6 +17,17 @@ async def test_websocket_requires_owner_jwt_and_restores_snapshot(client: AsyncC
     token = headers["Authorization"].removeprefix("Bearer ")
     _, stranger_headers = await register_user(client, "WS陌生人")
     stranger_token = stranger_headers["Authorization"].removeprefix("Bearer ")
+
+    # 开场 + 前几个 AI 同伴发言在后台任务里跑;等它推进到 PAINTING_TURN 再开始 WS 断言,
+    # 避免后台的 stage_changed/message_created 事件穿插到 heartbeat/progress 流里。
+    for _ in range(100):
+        snapshot = (await client.get(f"/api/rooms/{room_id}", headers=headers)).json()
+        if snapshot.get("stage") == "PAINTING_TURN":
+            break
+        await asyncio.sleep(0.05)
+    assert snapshot.get("stage") == "PAINTING_TURN", (
+        f"pre-roll did not reach PAINTING_TURN, got stage={snapshot.get('stage')!r}"
+    )
 
     with TestClient(app) as sync_client:
         try:

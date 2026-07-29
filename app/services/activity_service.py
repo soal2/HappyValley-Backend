@@ -1,17 +1,20 @@
 """Backend-owned painting relay orchestration with remote generation provenance."""
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from random import SystemRandom
-from typing import Any
+from time import monotonic
+from typing import Any, TypeVar
 
 import structlog
 import yaml
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.agents.base import (
     AgentRuntime,
@@ -21,11 +24,13 @@ from app.agents.base import (
     TextGenerationResult,
 )
 from app.config import get_settings
+from app.database import async_session_factory
 from app.domain.room_lock import room_lock_manager
 from app.media.storage import MediaStorage
 from app.models.postcard import GeneratedImage, Postcard
 from app.models.room import ActivityRoom, RoomMessage
 from app.models.user import User
+from app.realtime import connection_manager
 from app.services import character_generation_service, matching_service, queue_service, room_service
 from app.services.cleanup_service import CleanupService
 from app.services.crisis_service import CrisisService
@@ -34,6 +39,14 @@ from app.services.text_sanitizer import sanitize_user_text
 
 EventEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 logger = structlog.get_logger()
+GenerationResultT = TypeVar("GenerationResultT")
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    status: str
+    continuation_required: bool = False
+
 
 REFLECTION_INTENTS = [
     "看到共同画作时此刻最直接的感受",
@@ -67,6 +80,37 @@ def _generation(result: TextGenerationResult | ReflectionAnswerResult) -> dict[s
     return result.generation.model_dump()
 
 
+async def _observe_generation(
+    room: ActivityRoom,
+    state: dict[str, Any],
+    operation: str,
+    attempt: int,
+    turn_index: int | None,
+    member_id: str | None,
+    call: Callable[[], Awaitable[GenerationResultT]],
+) -> GenerationResultT:
+    started_at = monotonic()
+    succeeded = False
+    try:
+        result = await call()
+        succeeded = True
+        return result
+    finally:
+        logger.info(
+            "activity.generation_timing",
+            room_id=room.id,
+            command_id=state.get("active_command_id"),
+            revision=room.revision,
+            stage=room.current_stage,
+            operation=operation,
+            member_id=member_id,
+            turn_index=turn_index,
+            attempt=attempt,
+            duration_ms=round((monotonic() - started_at) * 1000),
+            succeeded=succeeded,
+        )
+
+
 def _payload_text(payload: dict[str, Any]) -> str:
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
@@ -76,9 +120,7 @@ def _payload_text(payload: dict[str, Any]) -> str:
     return sanitize_user_text(text.strip())
 
 
-def _merge_display_fields(
-    member: dict[str, Any], persona: dict[str, Any] | None
-) -> dict[str, Any]:
+def _merge_display_fields(member: dict[str, Any], persona: dict[str, Any] | None) -> dict[str, Any]:
     """Merge latest display fields from a persona snapshot into a member dict."""
     if persona is None:
         return member
@@ -293,7 +335,13 @@ async def create_activity_room(
     speaking_order = [str(member["id"]) for member in state["members"]]
     SystemRandom().shuffle(speaking_order)
     state["speaking_order"] = speaking_order
-    room.stage_state = state
+    # Force SQLAlchemy to detect the JSON column mutation — ``state`` was
+    # passed by reference to create_room earlier, so reassigning the same
+    # identity would be a silent no-op and the commit below would persist a
+    # stage_state with empty members/speaking_order. ``flag_modified`` is the
+    # explicit, idiomatic fix.
+    room.stage_state = dict(state)
+    flag_modified(room, "stage_state")
     await db.flush()
 
     if crisis:
@@ -310,13 +358,46 @@ async def create_activity_room(
         await db.flush()
         await db.commit()
     else:
-        opening_ready = await _generate_opening(room, state, db, agent_runtime)
-        if dynamic:
-            # Launch Stage B background persona generation (idempotent).
-            await character_generation_service.start_for_room(room.id)
-        if opening_ready:
-            await _run_v2_painting_until_human(room, state, db, agent_runtime, None)
+        # Stage A 已完成,room 与 members 已落库。开场话术 + 前几个 AI 同伴发言
+        # 通过 start_ai_intro_and_preroll 后台任务流式推送(WS 事件 stage_changed /
+        # message_created),让用户几秒内进房,避免在 HTTP 响应里等满 4 次 LLM 调用。
+        await db.commit()
+        await character_generation_service.start_ai_intro_and_preroll(room.id)
     return room
+
+
+async def run_ai_intro_and_preroll(room_id: str, agent_runtime: AgentRuntime) -> None:
+    """Background task: produce AI_INTRO opening + advance PAINTING_TURN through AI
+    peers until the human's turn. Streams events to the room's WebSocket via
+    ``connection_manager.send_to_room``.
+
+    Called from ``character_generation_service.start_ai_intro_and_preroll`` so the
+    HTTP request returns immediately after Stage A.
+    """
+    async with room_lock_manager.acquire(room_id):
+        async with async_session_factory() as db:
+            result = await db.execute(select(ActivityRoom).where(ActivityRoom.id == room_id))
+            room = result.scalar_one_or_none()
+            if room is None:
+                logger.warning("ai_intro_preroll_room_missing", room_id=room_id)
+                return
+
+            state = dict(room.stage_state or {})
+            dynamic = get_settings().CHARACTER_GENERATION_MODE == "dynamic"
+
+            async def emit(event: dict[str, Any]) -> None:
+                await connection_manager.send_to_room(room_id, event)
+
+            if dynamic:
+                # Launch Stage B background persona generation (idempotent).
+                await character_generation_service.start_for_room(room_id)
+
+            opening_ready = bool(state.get("can_skip"))
+            if room.current_stage == "AI_INTRO" and not opening_ready:
+                opening_ready = await _generate_opening(room, state, db, agent_runtime, emit)
+            if opening_ready and room.current_stage in {"AI_INTRO", "PAINTING_TURN"}:
+                await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
+            await db.commit()
 
 
 async def terminate_legacy_room_for_upgrade(
@@ -384,17 +465,11 @@ async def _run_v2_painting_until_human(
     contributions = list(state.get("contributions", []))
     index = int(state.get("painting_turn_index", len(contributions)))
 
-    # Stage C: wait for background persona generation, apply fallback, enrich peers.
     persona_map: dict[str, dict[str, Any]] | None = None
-    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
-        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+    dynamic = get_settings().CHARACTER_GENERATION_MODE == "dynamic"
 
     while index < len(order):
         member = _member_for(state, order[index])
-        if persona_map is not None:
-            persona = persona_map.get(str(member["id"]))
-            if persona is not None:
-                member = character_generation_service.enrich_peer_with_persona(member, persona)
         room.current_stage = "PAINTING_TURN"
         state.update(
             painting_turn_index=index,
@@ -406,15 +481,42 @@ async def _run_v2_painting_until_human(
         await _commit_state(room, state, db, emit, "stage_changed")
         if member["type"] == "human":
             return False
+        # Publish the pending AI turn before Stage C waits for background persona
+        # generation, so snapshot recovery can observe forward progress.
+        if dynamic and persona_map is None:
+            persona_map = await character_generation_service.ensure_personas_ready(room.id)
+        if persona_map is not None:
+            persona = persona_map.get(str(member["id"]))
+            if persona is not None:
+                member = character_generation_service.enrich_peer_with_persona(member, persona)
         previous = [str(item["text"]) for item in contributions]
         try:
+            attempts = 0
+            current_index = index
+            current_member = member
+            current_previous = previous
+
+            async def generate_peer(
+                current_index: int = current_index,
+                current_member: dict[str, Any] = current_member,
+                current_previous: list[str] = current_previous,
+            ) -> TextGenerationResult:
+                nonlocal attempts
+                attempts += 1
+                return await _observe_generation(
+                    room,
+                    state,
+                    "painting_peer",
+                    attempts,
+                    current_index,
+                    str(current_member["id"]),
+                    lambda: agent_runtime.generate_peer_turn(
+                        current_member, current_previous, max_duration_seconds=10
+                    ),
+                )
+
             result, speech = await _remote_spoken_text(
-                partial(
-                    agent_runtime.generate_peer_turn,
-                    member,
-                    previous,
-                    max_duration_seconds=10,
-                ),
+                generate_peer,
                 str(member.get("voice_id") or "facilitator"),
                 10_000,
                 _valid_peer_painting,
@@ -483,7 +585,15 @@ async def _generate_v2_image(
     db.add(image)
     await db.flush()
     await _commit_state(room, state, db, emit, "stage_changed")
-    result = await image_generator.generate(final_prompt)
+    result = await _observe_generation(
+        room,
+        state,
+        "image",
+        1,
+        None,
+        None,
+        lambda: image_generator.generate(final_prompt),
+    )
     if result.status != "completed" or not result.data:
         image.status = "failed"
         image.generation_meta = result.generation.model_dump() if result.generation else None
@@ -583,11 +693,19 @@ async def _complete_v2_activity(
             summary_speech: dict[str, object] | None = None
             candidate = None
             candidate_speech: dict[str, object] | None = None
-            for _ in range(2):
-                candidate = await agent_runtime.generate_summary(
-                    str(state.get("final_prompt", "")),
-                    transcript,
-                    max_duration_seconds=20,
+            for attempt in range(1, 3):
+                candidate = await _observe_generation(
+                    room,
+                    state,
+                    "summary",
+                    attempt,
+                    None,
+                    "facilitator",
+                    lambda: agent_runtime.generate_summary(
+                        str(state.get("final_prompt", "")),
+                        transcript,
+                        max_duration_seconds=20,
+                    ),
                 )
                 candidate_speech = await prepare_speech_meta(
                     candidate.summary_text, "facilitator", 20_000
@@ -653,18 +771,41 @@ async def _complete_v2_activity(
         if message["sender_type"] == "human" and message["stage"] == "REFLECTION_TURN"
     ]
     try:
-        postcard_text = await _remote_text(
-            lambda: agent_runtime.generate_postcard_text(
-                str(state.get("summary_text", "")),
-                "\n".join(human_texts) if human_texts else "用户本轮选择暂不分享",
+        attempts = 0
+
+        async def generate_postcard_text() -> TextGenerationResult:
+            nonlocal attempts
+            attempts += 1
+            return await _observe_generation(
+                room,
+                state,
+                "postcard_text",
+                attempts,
+                None,
+                "facilitator",
+                lambda: agent_runtime.generate_postcard_text(
+                    str(state.get("summary_text", "")),
+                    "\n".join(human_texts) if human_texts else "用户本轮选择暂不分享",
+                ),
             )
-        )
+
+        postcard_text = await _remote_text(generate_postcard_text)
     except Exception as error:
         state.update(generation_status="failed", generation_error=str(error))
         await _commit_state(
             room, state, db, emit, "error", error="generation_failed", recoverable=True
         )
         return
+    if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
+        persona_map = await character_generation_service.ensure_personas_ready(room.id)
+        state["members"] = [
+            (
+                _merge_display_fields(member, persona_map.get(str(member.get("id"))))
+                if member.get("type") == "ai_peer"
+                else member
+            )
+            for member in state.get("members", [])
+        ]
     members_by_id = {str(member["id"]): dict(member) for member in state.get("members", [])}
     ordered_members = [
         members_by_id[member_id]
@@ -730,20 +871,40 @@ async def _run_v2_reflection_until_human(
             return
         transcript = await _room_transcript(room.id, db)
         available_ids = {str(item["id"]) for item in transcript}
+        current_member = member
+        current_transcript = transcript
         try:
             answer = None
             answer_speech: dict[str, object] | None = None
-            for _ in range(2):
-                candidate = await agent_runtime.generate_reflection_answer(
-                    member,
-                    question_message.text,
-                    str(state.get("final_prompt", "")),
-                    transcript,
-                    max_duration_seconds=10,
+            attempts = 0
+
+            async def generate_reflection_answer(
+                current_member: dict[str, Any] = current_member,
+                current_transcript: list[dict[str, object]] = current_transcript,
+                current_turn_index: int = turn_index,
+            ) -> ReflectionAnswerResult:
+                nonlocal attempts
+                attempts += 1
+                return await _observe_generation(
+                    room,
+                    state,
+                    "reflection_answer",
+                    attempts,
+                    current_turn_index,
+                    str(current_member["id"]),
+                    lambda: agent_runtime.generate_reflection_answer(
+                        current_member,
+                        question_message.text,
+                        str(state.get("final_prompt", "")),
+                        current_transcript,
+                        max_duration_seconds=10,
+                    ),
                 )
+
+            for _ in range(2):
+                candidate = await generate_reflection_answer()
                 valid_references = [
-                    ref for ref in candidate.referenced_message_ids
-                    if ref in available_ids
+                    ref for ref in candidate.referenced_message_ids if ref in available_ids
                 ]
                 if valid_references != candidate.referenced_message_ids:
                     logger.warning(
@@ -842,14 +1003,29 @@ async def _start_v2_reflection_round(
         await _commit_state(room, state, db, emit, "stage_changed")
         transcript = await _room_transcript(room.id, db)
         try:
-            question, question_speech = await _remote_spoken_text(
-                lambda: agent_runtime.generate_reflection_question(
+            attempts = 0
+
+            async def generate_question() -> TextGenerationResult:
+                nonlocal attempts
+                attempts += 1
+                return await _observe_generation(
+                    room,
+                    state,
+                    "reflection_question",
+                    attempts,
                     round_index,
-                    REFLECTION_INTENTS[round_index],
-                    str(state.get("final_prompt", "")),
-                    transcript,
-                    max_duration_seconds=10,
-                ),
+                    "facilitator",
+                    lambda: agent_runtime.generate_reflection_question(
+                        round_index,
+                        REFLECTION_INTENTS[round_index],
+                        str(state.get("final_prompt", "")),
+                        transcript,
+                        max_duration_seconds=10,
+                    ),
+                )
+
+            question, question_speech = await _remote_spoken_text(
+                generate_question,
                 "facilitator",
                 10_000,
                 _valid_reflection_question(round_index),
@@ -1114,11 +1290,14 @@ async def _run_completion(
     if get_settings().CHARACTER_GENERATION_MODE == "dynamic":
         persona_map = await character_generation_service.ensure_personas_ready(room.id)
         postcard_members = [
-            _merge_display_fields(member, persona_map.get(str(member.get("id"))))
-            if member.get("type") == "ai_peer"
-            else member
+            (
+                _merge_display_fields(member, persona_map.get(str(member.get("id"))))
+                if member.get("type") == "ai_peer"
+                else member
+            )
             for member in postcard_members
         ]
+        state["members"] = postcard_members
     postcard = Postcard(
         user_id=room.user_id,
         room_id=room.id,
@@ -1252,8 +1431,37 @@ async def execute_command(
     image_generator: ImageGenerator,
     media_storage: MediaStorage,
     emit: EventEmitter | None = None,
-) -> str:
+) -> CommandOutcome:
+    if command_type == "heartbeat":
+        room = await db.scalar(select(ActivityRoom).where(ActivityRoom.id == room_id))
+        if room is None:
+            raise HTTPException(status_code=404, detail="房间不存在")
+        if room.user_id != user_id:
+            raise HTTPException(status_code=403, detail="无权访问此房间")
+        reconnect_cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            seconds=get_settings().RECONNECT_SECONDS
+        )
+        if (
+            room.status == "active"
+            and room.disconnected_at is not None
+            and room.disconnected_at.replace(tzinfo=None) < reconnect_cutoff
+        ):
+            state = dict(room.stage_state or {})
+            state["termination_reason"] = "reconnect_timeout"
+            room.stage_state = state
+            room.current_stage = "TERMINATED"
+            await CleanupService.cleanup_terminated_room(room.id, db, media_storage)
+            room.revision += 1
+            await db.commit()
+            await queue_service.release_capacity(db)
+            return CommandOutcome("accepted")
+        room.heartbeat_at = datetime.now(UTC)
+        room.disconnected_at = None
+        await db.commit()
+        return CommandOutcome("accepted")
+
     release_capacity = False
+    continuation_required = False
     async with room_lock_manager.acquire(room_id):
         room = await db.scalar(
             select(ActivityRoom).where(ActivityRoom.id == room_id).with_for_update()
@@ -1264,6 +1472,12 @@ async def execute_command(
             raise HTTPException(status_code=403, detail="无权访问此房间")
         state = dict(room.stage_state or {})
         if command_id in state.get("processed_command_ids", []):
+            if (
+                str(state.get("activity_version")) == "2.0"
+                and room.status == "active"
+                and state.get("generation_status") == "processing"
+            ):
+                return CommandOutcome("already_processed", continuation_required=True)
             if command_type == "submit_base" and (
                 room.current_stage.startswith("AI_TURN_")
                 or room.current_stage == "IMAGE_GENERATION"
@@ -1277,7 +1491,7 @@ async def execute_command(
                 "POSTCARD_GENERATION",
             }:
                 await _run_completion(room, state, db, agent_runtime, emit)
-            return "already_processed"
+            return CommandOutcome("already_processed")
         if room.status != "active" and command_type != "heartbeat":
             raise HTTPException(status_code=409, detail="活动已结束")
         if state.get("crisis") and command_type not in {"crisis_response", "heartbeat", "exit"}:
@@ -1323,7 +1537,16 @@ async def execute_command(
                 room.disconnected_at = None
                 resume_stage = str(state.pop("crisis_resume_stage", room.current_stage))
                 _remember_command(state, command_id)
-                if resume_stage == "AI_INTRO":
+                if resume_stage == "AI_INTRO" and str(state.get("activity_version")) == "2.0":
+                    room.current_stage = resume_stage
+                    state.update(
+                        active_command_id=command_id,
+                        generation_status="processing",
+                        generation_error=None,
+                    )
+                    await _commit_state(room, state, db, emit, "stage_changed")
+                    continuation_required = True
+                elif resume_stage == "AI_INTRO":
                     opening_ready = bool(state.get("can_skip")) or await _generate_opening(
                         room, state, db, agent_runtime, emit
                     )
@@ -1358,10 +1581,14 @@ async def execute_command(
             if expected_revision != room.revision:
                 raise HTTPException(status_code=409, detail="画作状态已变化，请使用最新快照")
             state["artwork_reveal_status"] = "acknowledged"
+            state.update(
+                active_command_id=command_id,
+                generation_status="processing",
+                generation_error=None,
+            )
             _remember_command(state, command_id)
             await _commit_state(room, state, db, emit)
-            await _start_v2_reflection_round(room, state, db, agent_runtime, emit)
-            release_capacity = room.status == "completed"
+            continuation_required = True
         elif command_type == "submit_painting_turn":
             if room.current_stage != "PAINTING_TURN":
                 raise HTTPException(status_code=409, detail="当前不是绘画发言阶段")
@@ -1400,12 +1627,15 @@ async def execute_command(
                 state.update(
                     contributions=contributions,
                     painting_turn_index=expected_index + 1,
+                    current_speaker_id=None,
+                    active_command_id=command_id,
+                    generation_status="processing",
+                    generation_error=None,
                 )
                 _remember_command(state, command_id)
+                await _commit_state(room, state, db, emit, "message_created", message_id=message.id)
                 await _maybe_emotional_checkin(room, state, text, db, agent_runtime, emit)
-                complete = await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
-                if complete:
-                    await _generate_v2_image(room, state, db, image_generator, media_storage, emit)
+                continuation_required = True
         elif command_type in {"submit_reflection", "skip_reflection"}:
             if room.current_stage != "REFLECTION_TURN":
                 raise HTTPException(status_code=409, detail="当前不是团体回顾发言阶段")
@@ -1424,7 +1654,7 @@ async def execute_command(
             if command_type == "submit_reflection":
                 text = _payload_text(payload)
                 if await _detect_and_pause(text, room, state, user_id, command_id, db, emit):
-                    return "accepted"
+                    return CommandOutcome("accepted")
             round_state = _reflection_round(state, expected_round)
             answers = list(round_state.get("answers", []))
             answer_record: dict[str, Any] = {
@@ -1446,11 +1676,17 @@ async def execute_command(
             round_state["answers"] = answers
             _store_reflection_round(state, expected_round, round_state)
             state["reflection_turn_index"] = turn_index + 1
+            state.update(
+                current_speaker_id=None,
+                active_command_id=command_id,
+                generation_status="processing",
+                generation_error=None,
+            )
             _remember_command(state, command_id)
+            await _commit_state(room, state, db, emit)
             if command_type == "submit_reflection" and text:
                 await _maybe_emotional_checkin(room, state, text, db, agent_runtime, emit)
-            await _run_v2_reflection_until_human(room, state, db, agent_runtime, emit)
-            release_capacity = room.status == "completed"
+            continuation_required = True
         elif command_type == "submit_base":
             if str(state.get("activity_version")) == "2.0":
                 raise HTTPException(status_code=409, detail="V2 活动请使用 submit_painting_turn")
@@ -1505,7 +1741,22 @@ async def execute_command(
             if state.get("generation_status") != "failed":
                 raise HTTPException(status_code=409, detail="当前没有可重试的生成任务")
             _remember_command(state, command_id)
-            if room.current_stage == "AI_INTRO":
+            if str(state.get("activity_version")) == "2.0" and room.current_stage in {
+                "AI_INTRO",
+                "PAINTING_TURN",
+                "REFLECTION_QUESTION",
+                "REFLECTION_TURN",
+                "AI_SUMMARY",
+                "POSTCARD_GENERATION",
+            }:
+                state.update(
+                    active_command_id=command_id,
+                    generation_status="processing",
+                    generation_error=None,
+                )
+                await _commit_state(room, state, db, emit)
+                continuation_required = True
+            elif room.current_stage == "AI_INTRO":
                 opening_ready = await _generate_opening(room, state, db, agent_runtime, emit)
                 if opening_ready and str(state.get("activity_version")) == "2.0":
                     await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
@@ -1534,7 +1785,17 @@ async def execute_command(
             if state.get("image_status") != "failed":
                 raise HTTPException(status_code=409, detail="当前没有失败的图片任务")
             _remember_command(state, command_id)
-            await _retry_image(room, state, db, image_generator, media_storage, emit)
+            if str(state.get("activity_version")) == "2.0":
+                state.update(
+                    active_command_id=command_id,
+                    image_status="generating",
+                    generation_status="processing",
+                    generation_error=None,
+                )
+                await _commit_state(room, state, db, emit)
+                continuation_required = True
+            else:
+                await _retry_image(room, state, db, image_generator, media_storage, emit)
         elif command_type in {"answer_follow_up", "skip_follow_up"}:
             raise HTTPException(status_code=409, detail="当前活动版本不会向用户追加问题")
         else:
@@ -1542,7 +1803,7 @@ async def execute_command(
 
     if release_capacity:
         await queue_service.release_capacity(db)
-    return "accepted"
+    return CommandOutcome("accepted", continuation_required=continuation_required)
 
 
 async def resume_interrupted_activity(
@@ -1552,6 +1813,7 @@ async def resume_interrupted_activity(
     agent_runtime: AgentRuntime,
     image_generator: ImageGenerator,
     media_storage: MediaStorage,
+    emit: EventEmitter | None = None,
 ) -> bool:
     """Resume a committed in-progress stage after process or socket interruption."""
     completed = False
@@ -1569,27 +1831,27 @@ async def resume_interrupted_activity(
             resumed = True
             opening_ready = bool(state.get("can_skip"))
             if not opening_ready and generation_processing:
-                opening_ready = await _generate_opening(room, state, db, agent_runtime, None)
+                opening_ready = await _generate_opening(room, state, db, agent_runtime, emit)
             if opening_ready:
-                await _run_v2_painting_until_human(room, state, db, agent_runtime, None)
+                await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
         elif (
             room.current_stage == "ARTWORK_REVEAL"
             and is_v2
             and state.get("artwork_reveal_status") == "acknowledged"
         ):
             resumed = True
-            await _start_v2_reflection_round(room, state, db, agent_runtime, None)
+            await _start_v2_reflection_round(room, state, db, agent_runtime, emit)
         elif room.current_stage == "PAINTING_TURN" and is_v2 and generation_processing:
             resumed = True
-            complete = await _run_v2_painting_until_human(room, state, db, agent_runtime, None)
+            complete = await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
             if complete:
-                await _generate_v2_image(room, state, db, image_generator, media_storage, None)
+                await _generate_v2_image(room, state, db, image_generator, media_storage, emit)
         elif room.current_stage == "REFLECTION_QUESTION" and is_v2 and generation_processing:
             resumed = True
-            await _start_v2_reflection_round(room, state, db, agent_runtime, None)
+            await _start_v2_reflection_round(room, state, db, agent_runtime, emit)
         elif room.current_stage == "REFLECTION_TURN" and is_v2 and generation_processing:
             resumed = True
-            await _run_v2_reflection_until_human(room, state, db, agent_runtime, None)
+            await _run_v2_reflection_until_human(room, state, db, agent_runtime, emit)
             completed = room.status == "completed"
         elif (
             room.current_stage in {"AI_SUMMARY", "POSTCARD_GENERATION"}
@@ -1597,11 +1859,11 @@ async def resume_interrupted_activity(
             and generation_processing
         ):
             resumed = True
-            await _complete_v2_activity(room, state, db, agent_runtime, None)
+            await _complete_v2_activity(room, state, db, agent_runtime, emit)
             completed = room.status == "completed"
         elif room.current_stage == "IMAGE_GENERATION" and is_v2 and generation_processing:
             resumed = True
-            await _retry_image(room, state, db, image_generator, media_storage, None)
+            await _retry_image(room, state, db, image_generator, media_storage, emit)
         elif not is_v2 and (
             room.current_stage.startswith("AI_TURN_") or room.current_stage == "IMAGE_GENERATION"
         ):

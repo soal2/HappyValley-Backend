@@ -1,5 +1,8 @@
 """Activity, queue, room, and command REST endpoints."""
 
+from time import monotonic
+
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,9 +21,15 @@ from app.schemas.activity import (
     StartActivityRequest,
     StartActivityResponse,
 )
-from app.services import activity_service, queue_service, room_service
+from app.services import (
+    activity_continuation_service,
+    activity_service,
+    queue_service,
+    room_service,
+)
 
 router = APIRouter()
+logger = structlog.get_logger()
 
 
 @router.post("/api/activities", response_model=StartActivityResponse)
@@ -93,7 +102,12 @@ async def active_room_snapshot(
         )
         await queue_service.release_capacity(db)
         raise HTTPException(status_code=409, detail="flow_upgraded")
-    return RoomSnapshotResponse(**await room_service.get_room_snapshot(room.id, user.id, db))
+    snapshot = RoomSnapshotResponse(**await room_service.get_room_snapshot(room.id, user.id, db))
+    if activity_continuation_service.needs_continuation(
+        snapshot.status, snapshot.stage, snapshot.stage_state
+    ):
+        await activity_continuation_service.start(room.id)
+    return snapshot
 
 
 @router.get("/api/rooms/{room_id}", response_model=RoomSnapshotResponse)
@@ -109,7 +123,12 @@ async def room_snapshot(
         )
         await queue_service.release_capacity(db)
         raise HTTPException(status_code=409, detail="flow_upgraded")
-    return RoomSnapshotResponse(**await room_service.get_room_snapshot(room_id, user.id, db))
+    snapshot = RoomSnapshotResponse(**await room_service.get_room_snapshot(room_id, user.id, db))
+    if activity_continuation_service.needs_continuation(
+        snapshot.status, snapshot.stage, snapshot.stage_state
+    ):
+        await activity_continuation_service.start(room_id)
+    return snapshot
 
 
 @router.get("/api/rooms/{room_id}/artwork")
@@ -140,7 +159,10 @@ async def room_command(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> RoomCommandResponse:
+    started_at = monotonic()
     container = Container.get()
+    if command.type == "exit":
+        await activity_continuation_service.cancel(room_id)
     result = await activity_service.execute_command(
         room_id,
         user.id,
@@ -153,4 +175,17 @@ async def room_command(
         container.media_storage,
     )
     snapshot = RoomSnapshotResponse(**await room_service.get_room_snapshot(room_id, user.id, db))
-    return RoomCommandResponse(status=result, snapshot=snapshot)
+    if result.continuation_required:
+        await activity_continuation_service.start(room_id, command.command_id)
+    logger.info(
+        "activity.command_confirmed",
+        transport="http",
+        room_id=room_id,
+        command_id=command.command_id,
+        command_type=command.type,
+        revision=snapshot.revision,
+        stage=snapshot.stage,
+        duration_ms=round((monotonic() - started_at) * 1000),
+        continuation_required=result.continuation_required,
+    )
+    return RoomCommandResponse(status=result.status, snapshot=snapshot)

@@ -14,12 +14,12 @@ from app.routes.activities import router as activities_router
 from app.routes.admin import router as admin_router
 from app.routes.auth import router as auth_router
 from app.routes.feedback import router as feedback_router
-from app.routes.postcards import router as postcards_router
-from app.routes.meditation_cards import router as meditation_cards_router
 from app.routes.gratitude_cards import router as gratitude_cards_router
+from app.routes.meditation_cards import router as meditation_cards_router
+from app.routes.postcards import router as postcards_router
 from app.routes.tts import router as tts_router
 from app.routes.websocket import router as websocket_router
-from app.services import character_generation_service
+from app.services import activity_continuation_service, character_generation_service
 from app.services.maintenance_service import maintain_runtime_state
 
 logger = structlog.get_logger()
@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     maintenance_task.cancel()
     with suppress(asyncio.CancelledError):
         await maintenance_task
+    await activity_continuation_service.cancel_all()
     await character_generation_service.cancel_all()
     logger.info("happyvalley_backend.shutdown")
 

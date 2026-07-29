@@ -12,8 +12,8 @@ Two-phase latency design:
   ``generate_peer_turn``.
 
 Concurrency invariants:
-- The persona authority is the ``room_characters`` table — never written into
-  ``stage_state.members`` (which is exposed via snapshots).
+- The persona authority is the ``room_characters`` table; only public display
+  fields are exposed in snapshots and retained in ``stage_state.members``.
 - The background task only writes ``room_characters``; it never acquires the room
   lock or touches ``stage_state``/``revision``.
 - ``_run_relay`` holds the room lock for at most ``CHARACTER_GENERATION_WAIT_SECONDS``
@@ -45,7 +45,7 @@ from app.models.room import ActivityRoom
 from app.models.room_character import RoomCharacter
 from app.models.user import User, UserProfile
 from app.realtime import connection_manager
-from app.services import matching_service
+from app.services import matching_service, room_service
 
 logger = structlog.get_logger()
 
@@ -96,6 +96,13 @@ _futures: dict[str, asyncio.Future[None]] = {}
 _registry_lock = asyncio.Lock()
 
 
+# Separate registry for the AI_INTRO + PAINTING_TURN pre-roll background task.
+# Not shared with Stage B's _tasks because the two have different lifecycles
+# (Stage B may finish before pre-roll, and either may be retried independently).
+_preroll_tasks: dict[str, asyncio.Task[None]] = {}
+_preroll_lock = asyncio.Lock()
+
+
 async def start_for_room(room_id: str) -> None:
     """Idempotently launch the Stage B background task for a room.
 
@@ -110,6 +117,50 @@ async def start_for_room(room_id: str) -> None:
             _futures[room_id] = asyncio.get_event_loop().create_future()
         task = asyncio.create_task(_generate_conceptual_personas(room_id))
         _tasks[room_id] = task
+
+
+async def start_ai_intro_and_preroll(room_id: str) -> None:
+    """Idempotently launch the AI_INTRO opening + PAINTING_TURN pre-roll background task.
+
+    Lets the HTTP request that creates the room return immediately after Stage A;
+    the opening message and the first few AI peer turns are then streamed to the
+    room's WebSocket via ``connection_manager.send_to_room`` as the task progresses.
+    """
+    async with _preroll_lock:
+        existing = _preroll_tasks.get(room_id)
+        if existing is not None and not existing.done():
+            return  # already running
+        task = asyncio.create_task(_run_ai_intro_and_preroll(room_id))
+        _preroll_tasks[room_id] = task
+
+
+async def _run_ai_intro_and_preroll(room_id: str) -> None:
+    """Background wrapper: load agent_runtime, invoke activity_service pre-roll, cleanup."""
+    # Lazy import to avoid a circular dependency: activity_service imports
+    # character_generation_service at module load.
+    from app.services import activity_service
+
+    try:
+        agent_runtime = Container.get().agent_runtime
+        logger.info("ai_intro_preroll_started", room_id=room_id)
+        await activity_service.run_ai_intro_and_preroll(room_id, agent_runtime)
+        logger.info("ai_intro_preroll_completed", room_id=room_id)
+    except Exception:
+        logger.exception("ai_intro_preroll_failed", room_id=room_id)
+        try:
+            await connection_manager.send_to_room(
+                room_id,
+                {
+                    "type": "error",
+                    "error": "pre_roll_failed",
+                    "recoverable": True,
+                },
+            )
+        except Exception:
+            logger.exception("ai_intro_preroll_error_emit_failed", room_id=room_id)
+    finally:
+        async with _preroll_lock:
+            _preroll_tasks.pop(room_id, None)
 
 
 async def wait_ready(room_id: str, timeout: float) -> bool:
@@ -137,12 +188,16 @@ async def cancel_all() -> None:
     async with _registry_lock:
         tasks = list(_tasks.values())
         futures = list(_futures.values())
+    async with _preroll_lock:
+        preroll_tasks = list(_preroll_tasks.values())
     for future in futures:
         if not future.done():
             future.cancel()
     for task in tasks:
         task.cancel()
-    for task in tasks:
+    for task in preroll_tasks:
+        task.cancel()
+    for task in tasks + preroll_tasks:
         try:
             await task
         except (asyncio.CancelledError, Exception):
@@ -150,6 +205,8 @@ async def cancel_all() -> None:
     async with _registry_lock:
         _tasks.clear()
         _futures.clear()
+    async with _preroll_lock:
+        _preroll_tasks.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +328,7 @@ def _member_slot(rc: RoomCharacter, voice_id: str) -> dict[str, Any]:
         "era": rc.era,
         "mbti": rc.mbti,
         "role": rc.role,
+        "one_line_concept": rc.one_line_concept,
         "appearance_id": rc.appearance_id,
         "voice_id": voice_id,
         "source": rc.source,
@@ -450,6 +508,19 @@ async def apply_fallback(rc: RoomCharacter, db: AsyncSession) -> None:
     rc.status = "ready"
 
 
+async def _send_team_updated(room_id: str) -> None:
+    """Publish committed display fields without reusing the generation session."""
+    async with async_session_factory() as db:
+        room = await db.scalar(select(ActivityRoom).where(ActivityRoom.id == room_id))
+        if room is None:
+            return
+        snapshot = await room_service.get_room_snapshot(room_id, room.user_id, db)
+    await connection_manager.send_to_room(
+        room_id,
+        {"type": "team_updated", "data": snapshot},
+    )
+
+
 async def _generate_conceptual_personas(room_id: str) -> None:
     """Stage B: generate full personas for conceptual characters in the background."""
     settings = get_settings()
@@ -528,10 +599,14 @@ async def _generate_conceptual_personas(room_id: str) -> None:
             await asyncio.gather(*[_generate_one(rc) for rc in conceptuals])
             await db.commit()
 
-        await connection_manager.send_to_room(room_id, {"type": "team_updated"})
+        try:
+            await _send_team_updated(room_id)
+        except Exception:
+            logger.exception("character_gen.team_updated_emit_failed", room_id=room_id)
         logger.info("character_gen.stage_b_complete", room_id=room_id)
     except Exception:
         logger.exception("character_gen.stage_b_failed", room_id=room_id)
+        fallback_completed = False
         try:
             async with async_session_factory() as db:
                 stale_result = await db.execute(
@@ -544,8 +619,14 @@ async def _generate_conceptual_personas(room_id: str) -> None:
                 for rc in stale_result.scalars():
                     await apply_fallback(rc, db)
                 await db.commit()
+                fallback_completed = True
         except Exception:
             logger.exception("character_gen.stage_b_fallback_failed", room_id=room_id)
+        if fallback_completed:
+            try:
+                await _send_team_updated(room_id)
+            except Exception:
+                logger.exception("character_gen.team_updated_emit_failed", room_id=room_id)
     finally:
         if future is not None and not future.done():
             future.set_result(None)

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     IMAGE_API_KEY: str | None = None
     IMAGE_MODEL: str | None = None
     IMAGE_BASE_URL: str | None = None
-    AI_TIMEOUT_SECONDS: float = 30.0
+    AI_TIMEOUT_SECONDS: float = 18.0
     IMAGE_TIMEOUT_SECONDS: float = 60.0
     TTS_PROVIDER: str = "elevenlabs"
     ELEVENLABS_API_KEY: str | None = None
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     MBTI_APPEARANCE_CONFIG_PATH: str = "config/mbti_appearance.yaml"
     CHARACTER_GENERATION_MODE: Literal["dynamic", "fixed"] = "dynamic"
     CHARACTER_GENERATION_TIMEOUT_SECONDS: float = 15.0
-    CHARACTER_GENERATION_WAIT_SECONDS: float = 5.0
+    CHARACTER_GENERATION_WAIT_SECONDS: float = 8.0
     CHARACTER_GENERATION_STALE_SECONDS: float = 30.0
 
     MEDIA_STORAGE_PATH: str = "./media"
