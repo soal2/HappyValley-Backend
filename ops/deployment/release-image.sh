@@ -103,6 +103,32 @@ with open(path, "w", encoding="utf-8") as fp:
 PY
 }
 
+cleanup_old_images() {
+  local service="$1" keep
+  keep="$(python3 - "$RELEASES_DIR" "$service" <<'PY'
+import json, pathlib, sys
+directory = pathlib.Path(sys.argv[1])
+service = sys.argv[2]
+commits = []
+for path in sorted(directory.glob(f"*-{service}-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+    if data.get("service") == service and data.get("result") == "success" and isinstance(data.get("commit"), str):
+        if data["commit"] not in commits:
+            commits.append(data["commit"])
+print("\n".join(commits[:3]))
+PY
+)"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    if ! grep -Fxq "$tag" <<<"$keep"; then
+      docker image rm "happyvalley-${service}:$tag" >/dev/null 2>&1 || true
+    fi
+  done < <(docker images "happyvalley-${service}" --format '{{.Tag}}' | grep -E '^[0-9a-f]{7,64}$' || true)
+}
+
 release_one() {
   local service="$1" commit="$2" archive="$3" image="happyvalley-${service}:${commit}"
   local prod_image="happyvalley-${service}:prod" previous_id="" previous_commit="unknown"
@@ -130,6 +156,7 @@ release_one() {
     detail="health check failed"
   else
     write_record "$service" "$commit" success "$previous_commit" "$detail"
+    cleanup_old_images "$service"
     find "$INCOMING_DIR" -maxdepth 1 -type f -name "${service}-${commit}.tar*" -delete
     echo "released $service at $commit"
     return 0
