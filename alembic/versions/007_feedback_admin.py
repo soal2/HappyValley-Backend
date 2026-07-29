@@ -19,7 +19,7 @@ def upgrade() -> None:
     # Add is_admin column to users
     op.add_column(
         "users",
-        sa.Column("is_admin", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("is_admin", sa.Boolean(), nullable=False, server_default=sa.text("false")),
     )
 
     # Feedback table (top-level messages + replies via parent_id self-reference)

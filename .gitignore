@@ -12,6 +12,7 @@ env/
 
 # Environment
 .env
+.env.prod
 
 # Database
 *.db
