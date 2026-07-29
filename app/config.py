@@ -59,6 +59,7 @@ class Settings(BaseSettings):
 
     MEDIA_STORAGE_PATH: str = "./media"
     CORS_ORIGINS: str = "http://localhost:5173"
+    ADMIN_USERNAMES: str = ""
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 

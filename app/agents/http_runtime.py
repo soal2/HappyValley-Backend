@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from app.agents.base import (
     AgentRuntime,
     ConceptualPersonaResult,
+    EmotionalCheckinResult,
     GenerationMeta,
     RankedMatch,
     ReflectionAnswerResult,
@@ -204,6 +205,8 @@ class HttpAgentRuntime(AgentRuntime):
         persona = str(character.get("system_prompt_template") or "")
         style = str(character.get("speak_style") or "")
         name = str(character.get("name", "AI团友"))
+        topics = character.get("topics") or []
+        topics_hint = "、".join(str(t) for t in topics[:2]) if topics else "人生的起伏"
 
         persona_block = ""
         if persona:
@@ -212,8 +215,13 @@ class HttpAgentRuntime(AgentRuntime):
             persona_block += f"\n【你的说话风格】\n{style}\n"
 
         system_prompt = (
-            f"你是【{name}】，正在参与绘画疗愈文字接龙活动。"
+            f"你是【{name}】，你自己亲自来参加这场绘画疗愈活动。"
+            f"你不是旁观者或助手——你带着自己的心情和困惑来到这里。\n"
             f"{persona_block}\n"
+            f"【你来这里的心情】\n"
+            f"你此刻带着与“{topics_hint}”相关的心情和困惑来到活动中。"
+            f"你的画面贡献应该映射你自己的内心需求——你希望通过画这一笔，"
+            f"表达或安顿自己的一些感受。让团友从你的描述中感受到你真实的在场。\n"
             "【任务要求】\n"
             "以“我希望这幅画上有”或“我想在这幅画上加上”开头，"
             "用你独有的语气和视角，为画面新增或修饰一段描述。"
@@ -245,6 +253,28 @@ class HttpAgentRuntime(AgentRuntime):
         )
         self._validate_facilitator_response(result.text)
         return result
+
+    async def generate_emotional_checkin(
+        self, user_text: str, context: str
+    ) -> EmotionalCheckinResult:
+        """Check user's painting-turn text for negative emotion; respond if needed."""
+        system_prompt = (
+            "你是心晴谷的AI带领者小晴。你正在观察团员在绘画接龙中的发言。\n"
+            "请判断该团员的发言是否流露出明显的负面情绪"
+            "（如悲伤、焦虑、绝望、愤怒、孤独、自我否定、无助等）。\n"
+            "如果检测到负面情绪，写1至2句、不超过80个汉字的温暖回应："
+            "先准确共情对方此刻的感受，再温和地给予支撑，不提问、不诊断、"
+            "不说教、不强行积极化。如果发言情绪中性或积极，不需要回应。\n"
+            '只返回JSON: {"needs_response": true/false, "text": "回应正文或空字符串"}'
+        )
+        user_msg = f"当前共同画面：{context}\n团员发言：{user_text}"
+        result = await self._call_chat(system_prompt, user_msg)
+        parsed = _parse_json_object(result.text)
+        return EmotionalCheckinResult(
+            needs_response=bool(parsed.get("needs_response", False)),
+            text=str(parsed.get("text", "")),
+            generation=result.generation,
+        )
 
     async def generate_reflection_question(
         self,

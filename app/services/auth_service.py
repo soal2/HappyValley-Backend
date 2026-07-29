@@ -31,9 +31,17 @@ async def register(username: str, password: str, db: AsyncSession) -> User:
     if existing:
         raise HTTPException(status_code=409, detail="用户名已被占用")
 
+    settings = get_settings()
+    admin_names = {
+        name.strip().lower()
+        for name in settings.ADMIN_USERNAMES.split(",")
+        if name.strip()
+    }
+
     user = User(
         username=username,
         password_hash=_hash_password(password),
+        is_admin=username.lower() in admin_names,
     )
     db.add(user)
     await db.flush()

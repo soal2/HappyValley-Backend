@@ -35,6 +35,14 @@ class ReflectionAnswerResult(BaseModel):
     generation: GenerationMeta
 
 
+class EmotionalCheckinResult(BaseModel):
+    """Result of facilitator emotional check-in after a user painting turn."""
+
+    needs_response: bool
+    text: str = ""  # facilitator response text; empty when needs_response is False
+    generation: GenerationMeta
+
+
 class ImageResult(BaseModel):
     data: bytes | None = None
     status: str  # "completed" | "failed"
@@ -184,6 +192,13 @@ class AgentRuntime(ABC):
         user_mood: str,
         user_profile: dict[str, object],
     ) -> ConceptualPersonaResult: ...
+
+    @abstractmethod
+    async def generate_emotional_checkin(
+        self, user_text: str, context: str
+    ) -> EmotionalCheckinResult:
+        """Check user's painting-turn text for negative emotion; respond if needed."""
+        ...
 
     @abstractmethod
     async def generate_practice_feedback(

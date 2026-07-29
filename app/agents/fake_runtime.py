@@ -8,6 +8,7 @@ from app.agents.base import (
     CognitiveStyle,
     ConceptualPersonaResult,
     ConceptualSkeleton,
+    EmotionalCheckinResult,
     ExpressionStyle,
     FiveDimPersona,
     GenerationMeta,
@@ -109,6 +110,17 @@ class FakeAgentRuntime(AgentRuntime):
         return self._text(
             "我听见你认真看见了自己的感受。你愿意把它表达出来，这份真诚和觉察很珍贵。",
             "fake-facilitator-response",
+        )
+
+    async def generate_emotional_checkin(
+        self, user_text: str, context: str
+    ) -> EmotionalCheckinResult:
+        self._record("emotional_checkin")
+        logger.info("fake_runtime.generate_emotional_checkin", mode="test")
+        return EmotionalCheckinResult(
+            needs_response=False,
+            text="",
+            generation=self._meta("fake-emotional-checkin"),
         )
 
     async def generate_reflection_question(

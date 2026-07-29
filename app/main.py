@@ -11,7 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import expand_cors_origins, get_settings
 from app.database import async_session_factory
 from app.routes.activities import router as activities_router
+from app.routes.admin import router as admin_router
 from app.routes.auth import router as auth_router
+from app.routes.feedback import router as feedback_router
 from app.routes.postcards import router as postcards_router
 from app.routes.meditation_cards import router as meditation_cards_router
 from app.routes.gratitude_cards import router as gratitude_cards_router
@@ -76,6 +78,8 @@ app.include_router(activities_router, tags=["activities"])
 app.include_router(postcards_router, tags=["postcards"])
 app.include_router(meditation_cards_router, tags=["meditation-cards"])
 app.include_router(gratitude_cards_router, tags=["gratitude-cards"])
+app.include_router(feedback_router, tags=["feedback"])
+app.include_router(admin_router, tags=["admin"])
 app.include_router(tts_router, tags=["tts"])
 app.include_router(websocket_router, tags=["websocket"])
 

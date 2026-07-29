@@ -467,8 +467,7 @@ async def _generate_v2_image(
     emit: EventEmitter | None,
 ) -> None:
     contributions = list(state.get("contributions", []))
-    final_prompt = "；".join(str(item["text"]) for item in contributions)
-    room.current_stage = "IMAGE_GENERATION"
+    final_prompt = _build_weighted_prompt(contributions)
     state.update(
         final_prompt=final_prompt,
         current_speaker_id=None,
@@ -964,7 +963,7 @@ async def _run_relay(
         state.update(contributions=contributions, generation_status="ready", generation_error=None)
         await _commit_state(room, state, db, emit, "message_created", message_id=message.id)
 
-    final_prompt = "；".join(str(item["text"]) for item in contributions)
+    final_prompt = _build_weighted_prompt(contributions)
     room.current_stage = "IMAGE_GENERATION"
     state.update(
         final_prompt=final_prompt,
@@ -1197,6 +1196,51 @@ async def _retry_image(
     await _commit_state(room, state, db, emit, "artwork_updated")
 
 
+def _build_weighted_prompt(contributions: list[dict[str, Any]]) -> str:
+    """Join all contributions; emphasize human player's text by repeating at end."""
+    all_texts = [str(item["text"]) for item in contributions]
+    base = "；".join(all_texts)
+    human_texts = [
+        str(item["text"])
+        for item in contributions
+        if item.get("member_type") == "human"
+    ]
+    if human_texts:
+        base += "。画面中必须重点体现：" + "，".join(human_texts)
+    return base
+
+
+async def _maybe_emotional_checkin(
+    room: ActivityRoom,
+    state: dict[str, Any],
+    user_text: str,
+    db: AsyncSession,
+    agent_runtime: AgentRuntime,
+    emit: EventEmitter | None,
+) -> None:
+    """Check user's text for negative emotion; insert facilitator response if needed."""
+    contributions = state.get("contributions", [])
+    context = "；".join(str(item["text"]) for item in contributions) if contributions else ""
+    try:
+        checkin = await agent_runtime.generate_emotional_checkin(user_text, context)
+    except Exception as error:
+        logger.warning("activity.emotional_checkin_failed", error=str(error))
+        return
+    if not checkin.needs_response or not checkin.text.strip():
+        return
+    message = RoomMessage(
+        room_id=room.id,
+        sender_type="ai",
+        sender_id="facilitator",
+        text=checkin.text,
+        stage=room.current_stage,
+        generation_meta=checkin.generation.model_dump(),
+    )
+    db.add(message)
+    await db.flush()
+    await _commit_state(room, state, db, emit, "message_created", message_id=message.id)
+
+
 async def execute_command(
     room_id: str,
     user_id: str,
@@ -1358,6 +1402,7 @@ async def execute_command(
                     painting_turn_index=expected_index + 1,
                 )
                 _remember_command(state, command_id)
+                await _maybe_emotional_checkin(room, state, text, db, agent_runtime, emit)
                 complete = await _run_v2_painting_until_human(room, state, db, agent_runtime, emit)
                 if complete:
                     await _generate_v2_image(room, state, db, image_generator, media_storage, emit)
@@ -1402,6 +1447,8 @@ async def execute_command(
             _store_reflection_round(state, expected_round, round_state)
             state["reflection_turn_index"] = turn_index + 1
             _remember_command(state, command_id)
+            if command_type == "submit_reflection" and text:
+                await _maybe_emotional_checkin(room, state, text, db, agent_runtime, emit)
             await _run_v2_reflection_until_human(room, state, db, agent_runtime, emit)
             release_capacity = room.status == "completed"
         elif command_type == "submit_base":
@@ -1431,6 +1478,7 @@ async def execute_command(
                     }
                 ]
                 _remember_command(state, command_id)
+                await _maybe_emotional_checkin(room, state, text, db, agent_runtime, emit)
                 await _run_relay(
                     room, state, db, agent_runtime, image_generator, media_storage, emit
                 )
@@ -1450,6 +1498,7 @@ async def execute_command(
                 )
                 state["user_sharing_text"] = text
                 _remember_command(state, command_id)
+                await _maybe_emotional_checkin(room, state, text, db, agent_runtime, emit)
                 await _run_completion(room, state, db, agent_runtime, emit)
                 release_capacity = room.status == "completed"
         elif command_type == "retry_current_stage":

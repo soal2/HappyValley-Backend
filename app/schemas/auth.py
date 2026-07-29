@@ -59,9 +59,12 @@ class ProfileResponse(BaseModel):
     birth_year: int | None = None
     appearance_id: str | None = None
     completed: bool
+    is_admin: bool = False
+    created_at: datetime | None = None
 
 
 class UserResponse(BaseModel):
     user_id: str
     username: str
     profile_completed: bool
+    is_admin: bool = False

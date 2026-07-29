@@ -38,3 +38,12 @@ async def require_profile_completed(
     if current_user.profile is None or not current_user.profile.completed:
         raise HTTPException(status_code=403, detail="请先完善个人资料")
     return current_user
+
+
+async def require_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Check that the current user has admin privileges."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return current_user

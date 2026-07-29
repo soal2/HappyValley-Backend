@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: hv_postgres
+    environment:
+      POSTGRES_USER: happyvalley
+      POSTGRES_PASSWORD: happyvalley
+      POSTGRES_DB: happyvalley
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U happyvalley -d happyvalley"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  backend:
+    image: happyvalley-backend:prod
+    container_name: hv_backend
+    env_file:
+      - ../HappyValley-Backend/.env.prod
+    environment:
+      DATABASE_URL: postgresql+asyncpg://happyvalley:happyvalley@postgres:5432/happyvalley
+    volumes:
+      - /root/happyvalley-deploy/data/media:/app/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8083"
+    restart: unless-stopped
+
+  frontend:
+    image: happyvalley-frontend:prod
+    container_name: hv_frontend
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOST: "0.0.0.0"
+    expose:
+      - "3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: hv_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - certs:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/certbot
+    container_name: hv_certbot
+    volumes:
+      - certs:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --renew-hook \"docker compose -f /deploy/docker-compose.prod.yml exec nginx nginx -s reload\"; sleep 12h & wait $${!}; done;'"
+
+volumes:
+  pg_data:
+  certs:

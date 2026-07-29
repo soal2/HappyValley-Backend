@@ -60,6 +60,7 @@ async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse
         user_id=current_user.id,
         username=current_user.username,
         profile_completed=profile_completed,
+        is_admin=current_user.is_admin,
     )
 
 
@@ -111,4 +112,6 @@ async def get_profile(
         birth_year=profile.birth_year if profile else None,
         appearance_id=profile.appearance_id if profile else None,
         completed=profile.completed if profile else False,
+        is_admin=current_user.is_admin,
+        created_at=current_user.created_at,
     )
