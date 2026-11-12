@@ -37,6 +37,11 @@ class ConnectionManager:
             self._send_locks.pop(room_id, None)
             return True
 
+    async def has_connection(self, room_id: str) -> bool:
+        """Whether the room currently owns a live WebSocket (liveness guard)."""
+        async with self._lock:
+            return room_id in self._connections
+
     async def send_to_room(self, room_id: str, payload: dict[str, object]) -> bool:
         """Send a payload to the room's current socket, serialized via a per-room send lock.
 
