@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     MAX_ACTIVE_ROOMS: int = 6
     RESERVATION_SECONDS: int = 60
     RECONNECT_SECONDS: int = 300
+    # 心跳兜底回收：前端每 20s 经 WS 发送 heartbeat；超过该时长无心跳且无存活 WS
+    # 连接的活跃房间视为僵尸房间，由维护循环终止，避免永久占用容量。
+    ROOM_HEARTBEAT_TIMEOUT_SECONDS: int = 600
     CHARACTERS_CONFIG_PATH: str = "config/characters.yaml"
     ACTIVITY_CONFIG_PATH: str = "config/painting_activity.yaml"
     CRISIS_CONFIG_PATH: str = "config/crisis_keywords.yaml"
@@ -59,6 +62,7 @@ class Settings(BaseSettings):
 
     MEDIA_STORAGE_PATH: str = "./media"
     CORS_ORIGINS: str = "http://localhost:5173"
+    CORS_ORIGIN_REGEX: str = r"^(null|https://([a-z0-9-]+\.)*lingguangcontent\.com)$"
     ADMIN_USERNAMES: str = ""
     HOST: str = "0.0.0.0"
     PORT: int = 8000

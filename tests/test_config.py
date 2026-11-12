@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -29,3 +31,14 @@ def test_ai_network_mode_defaults_to_auto_and_rejects_unknown_values() -> None:
     assert Settings(_env_file=None).AI_NETWORK_MODE == "auto"
     with pytest.raises(ValidationError):
         Settings(_env_file=None, AI_NETWORK_MODE="unknown")  # type: ignore[arg-type]
+
+
+def test_default_cors_regex_allows_lingguang_hosts_and_sandbox_origin() -> None:
+    pattern = Settings(_env_file=None).CORS_ORIGIN_REGEX
+
+    assert re.fullmatch(pattern, "null")
+    assert re.fullmatch(pattern, "https://preview.lingguangcontent.com")
+    assert re.fullmatch(pattern, "https://release-123.lingguangcontent.com")
+    assert re.fullmatch(pattern, "https://lingguangcontent.com")
+    assert re.fullmatch(pattern, "https://example.com") is None
+    assert re.fullmatch(pattern, "null.example.com") is None
