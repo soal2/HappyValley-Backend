@@ -25,7 +25,7 @@ from app.services.maintenance_service import maintain_runtime_state
 logger = structlog.get_logger()
 settings = get_settings()
 
-
+# 该函数用于定义应用程序的生命周期，包括启动和关闭钩子。它会在应用程序启动时启动一个维护循环，并在应用程序关闭时取消该循环和相关服务。
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: startup and shutdown hooks."""
